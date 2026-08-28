@@ -759,13 +759,6 @@ const std::vector<int64_t> & llama_kv_cache_kvarn_context::compact_read_plan() c
             scan_end = std::max(scan_end, cell + 1u);
         }
     }
-    std::vector<std::pair<llama_pos, uint32_t>> ordered;
-    ordered.reserve(cells.get_used());
-    for (uint32_t cell = 0; cell < scan_end; ++cell) {
-        if (!cells.is_empty(cell)) {
-            ordered.emplace_back(cells.pos_get(cell), cell);
-        }
-    }
     // Порядок плана определяет порядок, в котором ядро внимания обходит ячейки.
     // Сортировка по позиции безобидна при одной последовательности (ячейки уже
     // перебраны по возрастанию, значит и позиции возрастают), но при двух
@@ -793,15 +786,33 @@ const std::vector<int64_t> & llama_kv_cache_kvarn_context::compact_read_plan() c
         const char * env = getenv("LLAMA_KVARN_PLAN_ORDER");
         return env != nullptr && std::string(env) == "pos";
     }();
+    // Промежуточный вектор пар нужен только сортировке по позиции, а она по
+    // умолчанию выключена. Без неё он стоит лишнего прохода, вдвое большего
+    // объёма (восемь байт на ячейку против четырёх) и вызова pos_get на каждую
+    // ячейку — и всё это на КАЖДОМ шаге декодирования по всем занятым ячейкам,
+    // которых при двух слотах по 65000 токенов сто тридцать тысяч.
+    std::vector<uint32_t> occupied;
+    occupied.reserve(cells.get_used());
     if (order_by_pos) {
+        std::vector<std::pair<llama_pos, uint32_t>> ordered;
+        ordered.reserve(cells.get_used());
+        for (uint32_t cell = 0; cell < scan_end; ++cell) {
+            if (!cells.is_empty(cell)) {
+                ordered.emplace_back(cells.pos_get(cell), cell);
+            }
+        }
         std::stable_sort(ordered.begin(), ordered.end(), [](const auto & a, const auto & b) {
             return a.first < b.first || (a.first == b.first && a.second < b.second);
         });
-    }
-    std::vector<uint32_t> occupied;
-    occupied.reserve(ordered.size());
-    for (const auto & entry : ordered) {
-        occupied.push_back(entry.second);
+        for (const auto & entry : ordered) {
+            occupied.push_back(entry.second);
+        }
+    } else {
+        for (uint32_t cell = 0; cell < scan_end; ++cell) {
+            if (!cells.is_empty(cell)) {
+                occupied.push_back(cell);
+            }
+        }
     }
     std::vector<uint32_t> pending;
     if (!current_sinfo().empty()) {

@@ -362,12 +362,26 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
     cells.reserve(occupied_cells.size() + pending_cells.size());
     cells.insert(cells.end(), occupied_cells.begin(), occupied_cells.end());
     cells.insert(cells.end(), pending_cells.begin(), pending_cells.end());
-    std::set<uint32_t> seen;
+    // Отсев дубликатов по битовой карте вместо std::set.
+    //
+    // План строится заново на КАЖДОМ шаге декодирования, и через этот отсев
+    // проходят все занятые ячейки: при двух слотах по 65000 токенов это 130
+    // тысяч вставок в красно-чёрное дерево с отдельным выделением памяти под
+    // каждый узел. Битовая карта на ёмкость кэша — это одно выделение на
+    // 163840/8 = 20 КиБ и постоянное время на ячейку.
+    //
+    // Семантика прежняя: remove_if идёт по порядку, первое вхождение остаётся,
+    // последующие удаляются, выход за ёмкость по-прежнему бросает исключение.
+    std::vector<bool> seen(capacity, false);
     cells.erase(std::remove_if(cells.begin(), cells.end(), [&](uint32_t cell) {
         if (cell >= capacity) {
             throw std::invalid_argument("KVarN compact read-plan cell exceeds cache capacity");
         }
-        return !seen.insert(cell).second;
+        if (seen[cell]) {
+            return true;
+        }
+        seen[cell] = true;
+        return false;
     }), cells.end());
     if (cells.size() > capacity) {
         throw std::invalid_argument("KVarN compact read plan exceeds cache capacity");
