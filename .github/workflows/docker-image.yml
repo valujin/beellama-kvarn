@@ -216,11 +216,18 @@ jobs:
           cuobjdump --list-ptx build/bin/libggml-cuda.so \
             | sed -nE 's/.*\.(sm_[0-9a-z]+)\.ptx$/\1/p' | sort -u | tr '\n' ' '; echo
           mkdir -p out && cp -a build/bin/. out/
+          # Через tar, а не напрямую: actions/upload-artifact не сохраняет права
+          # и разыменовывает симлинки. Без этого бинарник приезжает без бита
+          # исполнения и контейнер падает с
+          # `exec: "/app/llama-server": permission denied` (прогон 33198872869),
+          # а симлинки libllama-common.so -> .so.0 -> .so.0.4.4 превращаются
+          # в три копии.
+          tar -czf bin.tar.gz -C out .
 
       - uses: actions/upload-artifact@v4
         with:
           name: bin
-          path: out
+          path: bin.tar.gz
           retention-days: 3
 
   package:
@@ -234,11 +241,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: bin
-          path: bin
+
+      - name: Распаковать бинарники
+        run: |
+          mkdir -p bin
+          tar -xzf bin.tar.gz -C bin
+          echo "файлов: $(ls bin | wc -l)"
+          ls -l bin/llama-server bin/libllama-common.so*
 
       - name: Собрать runtime-образ
         run: |
-          chmod -R a+rX bin
           DOCKER_BUILDKIT=1 docker build --progress=plain \
             -f docker/Dockerfile.package -t local/beellama-kvarn:build .
 
