@@ -126,42 +126,60 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates cmake ninja-build ccache git rsync \
+            build-essential ca-certificates cmake ninja-build ccache git \
             libcurl4-openssl-dev gcc-16 g++-16 gcc-15 g++-15
 
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Куски восстанавливаются в разные каталоги и сливаются: ccache хранит
-      # объекты по содержимому, поэтому слияние безопасно.
+      # Все шесть кусков восстанавливаются в ОДИН каталог и сливаются: ccache
+      # хранит объекты по содержимому, поэтому слияние безопасно.
+      #
+      # path обязан совпадать с тем, из которого кусок сохранялся: actions/cache
+      # ищет запись по паре (ключ, версия), а версия — хеш от path. В прогоне
+      # 33161529669 здесь стояло `path: slice-N`, ключ совпадал, версия нет,
+      # и все шесть записей оказались невидимы.
       - uses: actions/cache/restore@v4
-        with: { path: slice-1, key: 'ccache-shard-1-${{ github.sha }}' }
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-shard-1-${{ github.sha }}
+          fail-on-cache-miss: true
       - uses: actions/cache/restore@v4
-        with: { path: slice-2, key: 'ccache-shard-2-${{ github.sha }}' }
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-shard-2-${{ github.sha }}
+          fail-on-cache-miss: true
       - uses: actions/cache/restore@v4
-        with: { path: slice-3, key: 'ccache-shard-3-${{ github.sha }}' }
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-shard-3-${{ github.sha }}
+          fail-on-cache-miss: true
       - uses: actions/cache/restore@v4
-        with: { path: slice-4, key: 'ccache-shard-4-${{ github.sha }}' }
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-shard-4-${{ github.sha }}
+          fail-on-cache-miss: true
       - uses: actions/cache/restore@v4
-        with: { path: slice-5, key: 'ccache-shard-5-${{ github.sha }}' }
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-shard-5-${{ github.sha }}
+          fail-on-cache-miss: true
       - uses: actions/cache/restore@v4
-        with: { path: slice-6, key: 'ccache-shard-6-${{ github.sha }}' }
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-shard-6-${{ github.sha }}
+          fail-on-cache-miss: true
 
-      - name: Слить куски ccache
+      - name: Убедиться, что кэш прогрет
+        # Промах кэша здесь недопустим: без заставы задача молча пересобирает
+        # всё с нуля и упирается в таймаут через шесть часов. Ровно это и
+        # случилось в прогоне 33161529669.
         run: |
-          mkdir -p "$CCACHE_DIR"
-          for i in 1 2 3 4 5 6; do
-            if [ -d "slice-$i/.ccache" ]; then
-              rsync -a "slice-$i/.ccache/" "$CCACHE_DIR/"
-            elif [ -d "slice-$i" ]; then
-              rsync -a "slice-$i/" "$CCACHE_DIR/"
-            else
-              echo "::warning::кусок $i не восстановился"
-            fi
-            rm -rf "slice-$i"
-          done
           ccache -s | head -n 20
+          SIZE=$(ccache -s | grep -oE 'Cache size \(G[iB]+\): *[0-9.]+' | grep -oE '[0-9.]+$' | head -n1)
+          echo "размер слитого кэша: ${SIZE:-0} ГБ"
+          awk -v s="${SIZE:-0}" 'BEGIN { if (s+0 < 0.5) { print "::error::кэш не прогрет, сборка с нуля в таймаут не уложится"; exit 1 } }'
 
       - name: Конфигурация
         run: bash .github/ci-configure.sh
