@@ -340,6 +340,28 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
+    # Охрана десятого патча стопки (kvarn-group-claim, шестнадцатая волна).
+    #
+    # Нужен кэш KVarN, а тому нужна голова 128/256/512: у скачиваемого
+    # stories15M она 48, поэтому берётся синтетическая модель из
+    # test-generate-models — у неё key_length 128. Архитектура именно llama:
+    # qwen35 гибридный, его внимание уходит в llama_memory_hybrid, где
+    # структурной раскладки по группам нет.
+    #
+    # --kv-tail-tokens 1024 обязателен: без явного запроса политика хвоста
+    # делает хвост равным окну, представление становится native_exact, и модель
+    # строит обычный llama_kv_cache без групповой раскладки. Сам тест
+    # дополнительно проверяет, что структурная ветка исполнилась.
+    llama_build_and_test(test-kv-group-claim.cpp
+        LABEL main
+        ARGS -m "${MODEL_DIR}/llama-dense.gguf"
+             --cache-type-k kvarn5 --cache-type-v kvarn5 -ngl 0
+             --kv-tail-tokens 1024
+    )
+    set_tests_properties(test-kv-group-claim PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
     llama_test(
         test-recurrent-state-rollback
         LABEL main
