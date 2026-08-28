@@ -191,6 +191,7 @@ public:
 private:
     llama_kv_cache_context * base() const;
     const std::vector<int64_t> & compact_read_plan() const;
+    bool compact_read_plan_is_identity() const;
 
     llama_kv_cache_kvarn * cache;
     llama_memory_context_ptr base_ctx;

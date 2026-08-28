@@ -278,30 +278,57 @@ bool ggml_cuda_flash_attn_ext_kvarn(
 
 #else
 
+// Ширина блока редукции. Раньше здесь стояло GGML_CUDA_FATTN_KVARN_DIM (128),
+// то есть один блок из 128 нитей перебирал весь массив индексов — при n_kv 130304
+// это мегабайт на сторону, прочитанный одним мультипроцессором. Профиль на 3090
+// дал 607 мкс на запуск и 9.7 мс на шаг (13% всего шага декодирования) на ядре,
+// которое всего лишь заполняет дескрипторы. Редукция целочисленная, поэтому
+// расширение блока результат не меняет.
+#define GGML_CUDA_FATTN_KVARN_DESCS_THREADS 1024
+
 static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_live_index_for_thread(
         const int64_t * indices,
         const int n_indices,
         const int stream,
         const int groups_per_stream,
         const bool swa,
-        const bool read_indirect) {
+        const bool read_indirect,
+        const bool single_stream) {
     int live_index = 0;
-    for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
-        const int64_t encoded = indices[i];
-        GGML_UNUSED(read_indirect);
-        const int64_t idx = encoded < -1 ? -encoded - 2 : encoded;
-        if (swa) {
+    GGML_UNUSED(read_indirect);
+    if (swa) {
+        for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
+            const int64_t encoded = indices[i];
+            const int64_t idx = encoded < -1 ? -encoded - 2 : encoded;
             if (idx >= 0) {
                 live_index = max(live_index, (int) idx);
             }
-        } else {
-            const int group_global = (int) (idx / GGML_CUDA_FATTN_KVARN_DIM);
-            const int idx_stream = group_global / groups_per_stream;
-            if (idx_stream == stream) {
-                const int local_index = (group_global - stream * groups_per_stream) *
-                    GGML_CUDA_FATTN_KVARN_DIM + (int) (idx % GGML_CUDA_FATTN_KVARN_DIM);
-                live_index = max(live_index, local_index);
+        }
+        return live_index;
+    }
+    if (single_stream) {
+        // Один поток: stream == 0 и groups_per_stream покрывает всю арену, так что
+        // group_global / groups_per_stream тождественно ноль, а local_index
+        // сворачивается обратно в idx. Деление на рантайм-значение (самая дорогая
+        // операция во всём цикле) при этом исчезает.
+        for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
+            const int64_t encoded = indices[i];
+            const int64_t idx = encoded < -1 ? -encoded - 2 : encoded;
+            if (idx >= 0) {
+                live_index = max(live_index, (int) idx);
             }
+        }
+        return live_index;
+    }
+    for (int i = threadIdx.x; i < n_indices; i += blockDim.x) {
+        const int64_t encoded = indices[i];
+        const int64_t idx = encoded < -1 ? -encoded - 2 : encoded;
+        const int group_global = (int) (idx / GGML_CUDA_FATTN_KVARN_DIM);
+        const int idx_stream = group_global / groups_per_stream;
+        if (idx_stream == stream) {
+            const int local_index = (group_global - stream * groups_per_stream) *
+                GGML_CUDA_FATTN_KVARN_DIM + (int) (idx % GGML_CUDA_FATTN_KVARN_DIM);
+            live_index = max(live_index, local_index);
         }
     }
     return live_index;
@@ -352,15 +379,16 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
 
     const int k_stream = k_stream_start + out_stream;
     const int v_stream = v_stream_start + out_stream;
-    __shared__ int k_partial[GGML_CUDA_FATTN_KVARN_DIM];
-    __shared__ int v_partial[GGML_CUDA_FATTN_KVARN_DIM];
+    __shared__ int k_partial[GGML_CUDA_FATTN_KVARN_DESCS_THREADS];
+    __shared__ int v_partial[GGML_CUDA_FATTN_KVARN_DESCS_THREADS];
+    const bool single_stream = n_stream == 1;
     k_partial[threadIdx.x] = ggml_cuda_fattn_kvarn_live_index_for_thread(
-        k_indices, k_n_indices, k_stream, k_groups_per_stream, k_swa, k_read_indirect);
+        k_indices, k_n_indices, k_stream, k_groups_per_stream, k_swa, k_read_indirect, single_stream);
     v_partial[threadIdx.x] = ggml_cuda_fattn_kvarn_live_index_for_thread(
-        v_indices, v_n_indices, v_stream, v_groups_per_stream, v_swa, v_read_indirect);
+        v_indices, v_n_indices, v_stream, v_groups_per_stream, v_swa, v_read_indirect, single_stream);
     __syncthreads();
 
-    for (int stride = GGML_CUDA_FATTN_KVARN_DIM / 2; stride > 0; stride >>= 1) {
+    for (int stride = GGML_CUDA_FATTN_KVARN_DESCS_THREADS / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) {
             k_partial[threadIdx.x] = max(k_partial[threadIdx.x], k_partial[threadIdx.x + stride]);
             v_partial[threadIdx.x] = max(v_partial[threadIdx.x], v_partial[threadIdx.x + stride]);
@@ -424,7 +452,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
         int k_original_domain,
         int v_original_domain,
         cudaStream_t stream) {
-    ggml_cuda_fattn_kvarn_init_descs_kernel<<<plan.n_stream, GGML_CUDA_FATTN_KVARN_DIM, 0, stream>>>(
+    ggml_cuda_fattn_kvarn_init_descs_kernel<<<plan.n_stream, GGML_CUDA_FATTN_KVARN_DESCS_THREADS, 0, stream>>>(
         (const uint8_t *) plan.k.records->data,
         (const half *) plan.k.stage->data,
         (const int64_t *) plan.k.indices->data,
@@ -675,6 +703,24 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec(
 }
 
 
+// Порог n_q для split-декода. GGML_KVARN_SPLIT_MAX_Q позволяет менять его без
+// пересборки: 1 возвращает исходное поведение, значения выше — включают быстрый
+// маршрут для батченного декода нескольких слотов и для проверки черновика.
+static int ggml_cuda_fattn_kvarn_split_max_q() {
+    static const int value = [] {
+        const char * env = getenv("GGML_KVARN_SPLIT_MAX_Q");
+        int v = env ? atoi(env) : GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q;
+        if (v < 1) {
+            v = 1;
+        }
+        if (v > GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q) {
+            v = GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q;
+        }
+        return v;
+    }();
+    return value;
+}
+
 static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
         const ggml_cuda_fattn_kvarn_plan & plan,
         const ggml_tensor * dst) {
@@ -707,6 +753,13 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_supported(
         return false;
     }
     if (sinks != nullptr || max_bias != 0.0f) {
+        return false;
+    }
+    // Ядро добавляет каузальную маску только когда она есть (проверка
+    // mask_h != nullptr в fattn-mma-kvarn-decode.cuh). При одном токене запроса
+    // маскировать нечего, а при n_q > 1 её отсутствие дало бы каждой строке
+    // полное внимание по всему KV, то есть неверный результат.
+    if (Q->ne[1] > 1 && dst->src[3] == nullptr) {
         return false;
     }
     if (Q->ne[2] % plan.n_kv_heads != 0) {
@@ -1121,6 +1174,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
         int(Q->ne[0]), int(Q->ne[1]), gqa, plan.k.bits, plan.v.bits,
         plan.k.swa && plan.v.swa, dst->src[8] != nullptr,
         vector_eligible, split_eligible, prompt_prefill,
+        ggml_cuda_fattn_kvarn_split_max_q(),
     });
 
     if (route == GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR) {

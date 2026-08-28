@@ -8,6 +8,24 @@
 using namespace ggml_cuda_mma;
 
 static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_THREADS = 256;
+
+// Сколько блоков на мультипроцессор требовать от компилятора. Ядро упирается в
+// регистры, а не в shared и не в нити: замер на sm_86 (cuobjdump) для нашей
+// формы D=256, MAX_GQA=6, NWARPS=8, k5/v5 даёт REG:80 SHARED:12864 при 256
+// нитях, то есть 65536/(80*256) = 3 блока против 7 по shared и 6 по нитям.
+// Три блока по восемь варпов — 24 варпа из 48, ровно половина занятости.
+//
+// Авторы оригинальной KVarN пришли к тому же диагнозу (упор в пропускную
+// способность L1/TEX при занятости, ограниченной регистрами) и лечили его не
+// конвейеризацией, а наоборот — потолком на регистры ради большего числа
+// резидентных блоков: у них это дало -27% времени ядра и +7..8% сквозной
+// скорости. Здесь тот же приём: 4 блока требуют уложиться в 64 регистра.
+//
+// На численный результат не влияет: распределение регистров не меняет ни
+// набор операций, ни их порядок. Возможные спиллы в локальную память точны.
+#ifndef GGML_CUDA_FATTN_KVARN_DECODE_MIN_BLOCKS
+#define GGML_CUDA_FATTN_KVARN_DECODE_MIN_BLOCKS 4
+#endif
 static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_CHUNK   = 16;
 
 static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_decode_group_from_record(
@@ -94,14 +112,33 @@ static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_decode_unpack(
     } else if constexpr (BITS == 2) {
         return (raw[index >> 2] >> (2 * (index & 3))) & 0x03;
     } else if constexpr (BITS > 0) {
+        // Читаем 32-битными словами вместо пары однобайтовых загрузок со сдвигом.
+        // Извлекаются ровно те же биты, то есть результат побитово прежний, но
+        // инструкций загрузки на элемент становится ~1.13 вместо 2, а трафик L1
+        // падает примерно на 40%. Авторы оригинальной KVarN отдельно измерили
+        // этот приём на осях квантования: вдвое меньше транзакций L1 при
+        // побитово том же значении, и отметили, что горячее ядро упирается
+        // именно в пропускную способность L1, а не в память.
+        //
+        // Выравнивание: строка записи занимает 16*BITS байт (кратно 4), а начало
+        // записи выровнено на 16, поэтому raw всегда кратен четырём. Второе слово
+        // читается только когда элемент через него переходит, а тогда оно заведомо
+        // внутри строки — последний бит элемента лежит в пределах строки по
+        // построению формата.
+        const uint32_t * words = (const uint32_t *) raw;
         const int bit_offset = index * BITS;
-        const int byte_offset = bit_offset >> 3;
-        const int shift = bit_offset & 7;
-        uint16_t packed = (uint16_t) raw[byte_offset];
-        if (shift + BITS > 8) {
-            packed |= (uint16_t) raw[byte_offset + 1] << 8;
+        const int word_offset = bit_offset >> 5;
+        const int shift = bit_offset & 31;
+        // ЗАМЕРЕНО И ОТКАЧЕНО: __ldg на этих чтениях плюс __restrict__ на
+        // указателях ядра дали регрессию 27.81 -> 27.15 tok/s при побитово том же
+        // выводе. Стековый кадр при этом вырос с 32 до 80 байт — компилятор стал
+        // больше держать в локальной памяти, а её трафик идёт через тот же кэш,
+        // который правка и пыталась разгрузить.
+        uint64_t packed = (uint64_t) words[word_offset];
+        if (shift + BITS > 32) {
+            packed |= (uint64_t) words[word_offset + 1] << 32;
         }
-        return (packed >> shift) & ((1 << BITS) - 1);
+        return (int) ((packed >> shift) & (uint64_t) ((1u << BITS) - 1u));
     }
 
     if (bits == 8) {
@@ -124,6 +161,12 @@ static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_decode_unpack(
 }
 
 template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>
+// Потолок нитей на мультипроцессор у sm_86 равен 1536, поэтому требовать четыре
+// блока можно только пока NWARPS*32*4 в него укладывается. При NWARPS=16 это 2048,
+// и ptxas молча игнорирует указание целиком — берём максимум допустимого.
+__launch_bounds__(NWARPS * 32,
+    (1536 / (NWARPS * 32)) < GGML_CUDA_FATTN_KVARN_DECODE_MIN_BLOCKS ?
+        (1536 / (NWARPS * 32)) : GGML_CUDA_FATTN_KVARN_DECODE_MIN_BLOCKS)
 static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         const char * Q,
         const ggml_cuda_fattn_kvarn_desc * k_descs,
@@ -162,6 +205,11 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     constexpr int WARPS_PER_CHUNK = D / GGML_CUDA_FATTN_KVARN_DIM;
     constexpr int CHUNKS_PER_PASS = NWARPS / WARPS_PER_CHUNK;
     constexpr int Q_STRIDE2 = D / 2 + 4;
+    // load_ldmatrix ниже читает из q_sh фиксированные 8 строк, поэтому при
+    // MAX_GQA == 6 массив на шесть строк давал чтение за его границей (попадало
+    // в score_partial_sh). Результат лишних строк отбрасывается по h < MAX_GQA,
+    // но само чтение было некорректным.
+    constexpr int Q_ROWS = MAX_GQA < 8 ? 8 : MAX_GQA;
     constexpr int P_STRIDE2 = SPLIT_TOKENS / 2 + 4;
 
     using T_A = tile<16, 8, half2>;
@@ -181,13 +229,24 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     static_assert(PHYSICAL_WAVE_SIZE == 32 || PHYSICAL_WAVE_SIZE == 64,
         "KVarN decode MMA requires a physical wave size of 32 or 64");
 
-    __shared__ __align__(16) half2 q_sh[MAX_GQA][Q_STRIDE2];
+    __shared__ __align__(16) half2 q_sh[Q_ROWS][Q_STRIDE2];
     __shared__ __align__(16) float score_partial_sh[NWARPS][MAX_GQA * TOKENS_PER_CHUNK];
     __shared__ __align__(16) float score_sh[MAX_GQA][SPLIT_TOKENS];
     __shared__ __align__(16) half2 p_sh[MAX_GQA][P_STRIDE2];
-    __shared__ float scale_axis_sh[SLICES][GGML_CUDA_FATTN_KVARN_DIM];
-    __shared__ float zp_axis_sh[SLICES][GGML_CUDA_FATTN_KVARN_DIM];
-    __shared__ float other_axis_sh[SLICES][GGML_CUDA_FATTN_KVARN_DIM];
+    // Оси квантования лежат в записи как half и раньше раскладывались в shared
+    // как float. Точности это не добавляло ни одного бита — значение уже прошло
+    // округление до half при записи, — зато стоило вдвое больше байт shared и
+    // вдвое больше трафика LDS в горячем цикле. Держим их half и переводим во
+    // float в точке использования: результат побитово тот же.
+    //
+    // Три оси лежат в записи подряд и выровнены на 16 байт (payload_bytes всегда
+    // кратен 16), поэтому одна область на слайс копируется векторными uint4.
+    constexpr int AXES_HALVES = 3 * GGML_CUDA_FATTN_KVARN_DIM;
+    constexpr int AXES_VEC    = (AXES_HALVES * (int) sizeof(half)) / (int) sizeof(uint4);
+    __shared__ __align__(16) half axes_sh[SLICES][AXES_HALVES];
+#define KVARN_AXIS_SCALE(sl, i) __half2float(axes_sh[sl][(i)])
+#define KVARN_AXIS_ZP(sl, i)    __half2float(axes_sh[sl][GGML_CUDA_FATTN_KVARN_DIM + (i)])
+#define KVARN_AXIS_OTHER(sl, i) __half2float(axes_sh[sl][2 * GGML_CUDA_FATTN_KVARN_DIM + (i)])
     __shared__ float zq_sh[SLICES][MAX_GQA];
     __shared__ float m_sh[MAX_GQA];
     __shared__ float denom_sh[MAX_GQA];
@@ -227,7 +286,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     }
 
     half * q_h = (half *) q_sh;
-    for (int i = tid; i < MAX_GQA * D; i += NWARPS * PHYSICAL_WAVE_SIZE) {
+    for (int i = tid; i < Q_ROWS * D; i += NWARPS * PHYSICAL_WAVE_SIZE) {
         const int h = i / D;
         const int dim = i % D;
         float value = 0.0f;
@@ -239,20 +298,21 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     }
 
     if (k_split_in_group) {
-        for (int i = tid; i < SLICES * GGML_CUDA_FATTN_KVARN_DIM; i += NWARPS * PHYSICAL_WAVE_SIZE) {
-            const int slice = i / GGML_CUDA_FATTN_KVARN_DIM;
-            const int axis = i % GGML_CUDA_FATTN_KVARN_DIM;
-            const half * scale_axis = (const half *) (k_records[slice] + k_payload_bytes);
-            const half * zp_axis = scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
-            const half * other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
-            scale_axis_sh[slice][axis] = __half2float(scale_axis[axis]);
-            zp_axis_sh[slice][axis] = __half2float(zp_axis[axis]);
-            other_axis_sh[slice][axis] = __half2float(other_axis[axis]);
+        for (int i = tid; i < SLICES * AXES_VEC; i += NWARPS * PHYSICAL_WAVE_SIZE) {
+            const int slice = i / AXES_VEC;
+            const int vec   = i % AXES_VEC;
+            const uint4 * src = (const uint4 *) (k_records[slice] + k_payload_bytes);
+            ((uint4 *) axes_sh[slice])[vec] = src[vec];
         }
     }
     __syncthreads();
 
     if (k_split_in_group) {
+        // Замер на 3090 (парный прогон, один слот, глубина 65000): распараллеливание
+        // этого цикла по варпам с древовидной свёрткой zq дало 27.70 против 27.71
+        // tok/s, то есть ровно ничего, при том что меняло порядок суммирования zq
+        // и, значит, численный результат. Оставляем последовательную форму: она
+        // побитово совпадает с эталоном и не требует отдельной проверки точности.
         const int n_targets = SLICES * gqa_head_count;
         for (int target = tid; target < n_targets; target += NWARPS * PHYSICAL_WAVE_SIZE) {
             const int slice = target / gqa_head_count;
@@ -261,14 +321,15 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
             float zq = 0.0f;
             for (int dim = 0; dim < GGML_CUDA_FATTN_KVARN_DIM; ++dim) {
                 const float q_val = __half2float(q_row[dim]);
-                zq += zp_axis_sh[slice][dim] * q_val;
-                const float q_prime = scale_axis_sh[slice][dim] * q_val;
+                zq += KVARN_AXIS_ZP(slice, dim) * q_val;
+                const float q_prime = KVARN_AXIS_SCALE(slice, dim) * q_val;
                 ((half *) q_sh)[h * (2 * Q_STRIDE2) + slice * GGML_CUDA_FATTN_KVARN_DIM + dim] =
                     __float2half(q_prime);
             }
             zq_sh[slice][h] = zq;
         }
     }
+
     __syncthreads();
 
     const int local_chunk = warp / WARPS_PER_CHUNK;
@@ -287,6 +348,14 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         }
 
         if (chunk_active) {
+            // ЗАМЕРЕНО И ОТКАЧЕНО: развёртка вдвое здесь и в цикле V дала
+            // 27.54 против 27.87 tok/s на одном слоте и 12.59 против 13.88 на двух,
+            // то есть регрессию, при том что регистровое давление даже упало
+            // (61 против 64) и вытеснения не появилось. Задержка глобальных
+            // обращений не прячется числом висящих загрузок: она встроена в шаблон
+            // доступа — раскладка матричного фрагмента требует от нити элементы из
+            // четырёх разных строк записи, и одна инструкция неизбежно задевает
+            // четыре сектора, забирая из каждого по нескольку байт.
 #pragma unroll 1
             for (int dim0 = warp_in_chunk * GGML_CUDA_FATTN_KVARN_DIM;
                     dim0 < (warp_in_chunk + 1) * GGML_CUDA_FATTN_KVARN_DIM;
@@ -328,7 +397,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                     float v = scores.x[l];
                     if (k_split_in_group && h < gqa_head_count) {
                         const int pos = k_tile.pos_begin + chunk * TOKENS_PER_CHUNK + j;
-                        v = other_axis_sh[warp_in_chunk][pos] * (v + zq_sh[warp_in_chunk][h]);
+                        v = KVARN_AXIS_OTHER(warp_in_chunk, pos) * (v + zq_sh[warp_in_chunk][h]);
                     }
                     score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] = v;
                 }
@@ -429,19 +498,33 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     __syncthreads();
 
     if (v_from_record) {
-        for (int i = tid; i < SLICES * GGML_CUDA_FATTN_KVARN_DIM; i += NWARPS * PHYSICAL_WAVE_SIZE) {
-            const int slice = i / GGML_CUDA_FATTN_KVARN_DIM;
-            const int axis = i % GGML_CUDA_FATTN_KVARN_DIM;
-            const half * scale_axis = (const half *) (v_records[slice] + v_payload_bytes);
-            const half * zp_axis = scale_axis + GGML_CUDA_FATTN_KVARN_DIM;
-            const half * other_axis = zp_axis + GGML_CUDA_FATTN_KVARN_DIM;
-            scale_axis_sh[slice][axis] = __half2float(scale_axis[axis]);
-            zp_axis_sh[slice][axis] = __half2float(zp_axis[axis]);
-            other_axis_sh[slice][axis] = __half2float(other_axis[axis]);
+        for (int i = tid; i < SLICES * AXES_VEC; i += NWARPS * PHYSICAL_WAVE_SIZE) {
+            const int slice = i / AXES_VEC;
+            const int vec   = i % AXES_VEC;
+            const uint4 * src = (const uint4 *) (v_records[slice] + v_payload_bytes);
+            ((uint4 *) axes_sh[slice])[vec] = src[vec];
         }
     }
     __syncthreads();
 
+    // ЗАМЕРЕНО И ОТКАЧЕНО: свёртка стороны V по образцу стороны K (по-токенный
+    // масштаб в веса софтмакса, сумма p*zp в скаляр, по-канальный множитель на
+    // выходе). Реализована, корректна — потокенная сверка показала ожидаемое
+    // расхождение округления на 16-м и 82-м токене, — но скорости не дала ни на
+    // одном режиме: 39.79 против 39.75 и 34.60 против 34.53 tok/s.
+    //
+    // Причина: профиль ncu показывает простой варпа 6.1 такта из 15.2 в ожидании
+    // L1TEX, но в терминах ncu L1TEX это локальная, глобальная, поверхностная и
+    // текстурная память — разделяемая учитывается отдельно. Ждём мы глобальных
+    // загрузок при распаковке полезной нагрузки, а не чтений масштабов из
+    // разделяемой памяти, которые свёртка и убирала. Число LDG в машинном коде
+    // при свёртке не изменилось: 1007 против 1007.
+    //
+    // Настоящая цель — раскладка матричного фрагмента: одна инструкция загрузки
+    // задевает четыре строки записи на расстоянии 160 байт, забирая из каждой по
+    // несколько байт. Лечится коллективной коалесцированной загрузкой полезной
+    // нагрузки в разделяемую память с последующей раздачей по фрагментам либо
+    // сменой раскладки записи.
 #pragma unroll 1
     for (int dim0 = warp * TOKENS_PER_CHUNK; dim0 < D; dim0 += NWARPS * TOKENS_PER_CHUNK) {
         const int slice = dim0 / GGML_CUDA_FATTN_KVARN_DIM;
@@ -470,11 +553,11 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                     const uint8_t * row1 = v_records[slice] + pos1 * v_row_bytes;
                     const int q0 = ggml_cuda_fattn_kvarn_decode_unpack<V_BITS>(row0, local_dim0 + local_dim, V_BITS);
                     const int q1 = ggml_cuda_fattn_kvarn_decode_unpack<V_BITS>(row1, local_dim0 + local_dim, V_BITS);
-                    const float other = other_axis_sh[slice][local_dim0 + local_dim];
-                    x0 = (float(q0) * scale_axis_sh[slice][pos0] +
-                            zp_axis_sh[slice][pos0]) * other;
-                    x1 = (float(q1) * scale_axis_sh[slice][pos1] +
-                            zp_axis_sh[slice][pos1]) * other;
+                    const float other = KVARN_AXIS_OTHER(slice, local_dim0 + local_dim);
+                    x0 = (float(q0) * KVARN_AXIS_SCALE(slice, pos0) +
+                            KVARN_AXIS_ZP(slice, pos0)) * other;
+                    x1 = (float(q1) * KVARN_AXIS_SCALE(slice, pos1) +
+                            KVARN_AXIS_ZP(slice, pos1)) * other;
                 } else {
                     const int token0_pair = token0 + token_local;
                     x0 = token0_pair + 0 < token_end ?

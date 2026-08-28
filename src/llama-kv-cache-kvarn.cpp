@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <limits>
 #include <map>
 #include <set>
@@ -682,12 +684,65 @@ const llama_ubatch & llama_kv_cache_kvarn_context::get_ubatch() const {
 }
 
 uint32_t llama_kv_cache_kvarn_context::get_n_kv() const {
-    return cache->uses_compact_read_indices() ?
+    return uses_compact_read_indices() ?
             uint32_t(compact_read_plan().size()) : base()->get_n_kv();
 }
 
+bool llama_kv_cache_kvarn_context::compact_read_plan_is_identity() const {
+    const auto & plan = compact_read_plan();
+    for (size_t read = 0; read < plan.size(); ++read) {
+        if (plan[read] < 0) {
+            break;      // дальше только заглушки, они и так маскируются
+        }
+        if (plan[read] != int64_t(read)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool llama_kv_cache_kvarn_context::uses_compact_read_indices() const {
-    return cache->uses_compact_read_indices();
+    if (!cache->uses_compact_read_indices()) {
+        return false;
+    }
+    // Косвенное чтение включается по статическому свойству кэша (несколько
+    // последовательностей в одном потоке), а не по тому, нужно ли оно на самом
+    // деле. Но после упорядочивания плана по номеру ячейки типичный случай —
+    // тождественный план: слоты набивают арену подряд, дырок нет, и элемент j
+    // указывает ровно на ячейку j. Тогда индексы — чистые накладные расходы:
+    // ядро грузит int64 на каждый токен, чтобы получить то же самое число.
+    // Замер на 3090, один запрос глубиной 60000: 24.77 tok/s с косвенностью
+    // против 30.43 без неё при прочих равных.
+    //
+    // Тождественность плана означает отсутствие дырок, поэтому базовый n_kv и
+    // базовая маска совпадают с планом, и переход на прямое чтение согласован.
+    //
+    // ВЫКЛЮЧЕНО ПО УМОЛЧАНИЮ по результатам замеров.
+    //
+    // Прежние +11% относились к состоянию ДО починки ядра дескрипторов: прямое
+    // чтение отключает построение тензора индексов и тем самым избавляло то ядро
+    // от перебора мегабайта индексов. Ту же трату мы устранили напрямую, расширив
+    // его блок со 128 нитей до 1024. На текущей базе прямое чтение даёт 27.58
+    // против 27.83 tok/s на одном слоте и 27.64 против 27.64 на двух, то есть
+    // ничего или чуть хуже — при том что численный результат меняет.
+    //
+    // Численное расхождение с косвенным путём объяснено. Профиль с --parallel 1,
+    // где косвенное чтение не включается вовсе, даёт ровно тот же вывод, что и
+    // прямое чтение (sha 64635495f2ed), тогда как косвенный путь даёт свой
+    // (ab50a617ca86). То есть «странным» оказывается косвенный путь, а прямое
+    // чтение совпадает с каноническим путём без плана. Причина: размер плана
+    // дополняется до кратного 256, а базовый n_kv дополняется по своему правилу,
+    // отсюда другое число сплитов и другая группировка суммирования в софтмаксе.
+    // Сверка с portable-эталоном это подтверждает: прямое чтение расходится с
+    // эталоном ПОЗЖЕ косвенного (64 токена против 13 на глубине 5000, 57 против 5
+    // на 26000), то есть ближе к эталону.
+    //
+    // LLAMA_KVARN_DIRECT_IDENTITY=0 возвращает косвенное чтение для сверки.
+    static const bool allow_direct = [] {
+        const char * env = getenv("LLAMA_KVARN_DIRECT_IDENTITY");
+        return env != nullptr && std::string(env) == "1";
+    }();
+    return !(allow_direct && compact_read_plan_is_identity());
 }
 
 const std::vector<int64_t> & llama_kv_cache_kvarn_context::compact_read_plan() const {
@@ -711,9 +766,38 @@ const std::vector<int64_t> & llama_kv_cache_kvarn_context::compact_read_plan() c
             ordered.emplace_back(cells.pos_get(cell), cell);
         }
     }
-    std::stable_sort(ordered.begin(), ordered.end(), [](const auto & a, const auto & b) {
-        return a.first < b.first || (a.first == b.first && a.second < b.second);
-    });
+    // Порядок плана определяет порядок, в котором ядро внимания обходит ячейки.
+    // Сортировка по позиции безобидна при одной последовательности (ячейки уже
+    // перебраны по возрастанию, значит и позиции возрастают), но при двух
+    // последовательностях с совпадающими диапазонами позиций план становится
+    // строго чередующимся между двумя далёкими областями ячеек. Ядро проверяет
+    // непрерывность тайла как (последняя ячейка - первая) == 63
+    // (ggml_cuda_fattn_kvarn_decode_plan_tile), и при чередовании это условие
+    // не выполняется НИ НА ОДНОМ тайле: быстрый путь отключается целиком, и
+    // каждый элемент K и V идёт поэлементной загрузкой с рантайм-битностью.
+    // Замер на 3090, два слота по 60000 токенов, n_kv 130k: 3.95 tok/s против
+    // 13.55 у того же шейпа без unified-кэша, где косвенного чтения нет вовсе.
+    //
+    // Для корректности порядок безразличен: маска строится по плану, а не по
+    // предположению о монотонности позиций. Поэтому по умолчанию сохраняем
+    // порядок по ячейке (то есть не сортируем вовсе). Переменная
+    // LLAMA_KVARN_PLAN_ORDER=pos возвращает прежнее поведение — ТОЛЬКО для
+    // сверки. Это не безопасный откат: проверки непрерывности тайла смотрят
+    // лишь на концы диапазона (последняя ячейка минус первая равна длине
+    // пролёта), что корректно только при монотонности по ячейке. При порядке
+    // по позиции чередующийся план может дать ложное совпадение — например,
+    // ячейки 128..159 и 160..191 с одинаковыми позициями дают план
+    // 128,160,129,161,...,159,191, где 191-128 == 63 — и тайл будет ошибочно
+    // признан непрерывным, а прочитан подряд, вразрез с маской.
+    static const bool order_by_pos = [] {
+        const char * env = getenv("LLAMA_KVARN_PLAN_ORDER");
+        return env != nullptr && std::string(env) == "pos";
+    }();
+    if (order_by_pos) {
+        std::stable_sort(ordered.begin(), ordered.end(), [](const auto & a, const auto & b) {
+            return a.first < b.first || (a.first == b.first && a.second < b.second);
+        });
+    }
     std::vector<uint32_t> occupied;
     occupied.reserve(ordered.size());
     for (const auto & entry : ordered) {
@@ -954,7 +1038,7 @@ void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs(ggml_tensor * dst, c
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I64);
 
-    if (cache->uses_compact_read_indices()) {
+    if (uses_compact_read_indices()) {
         const auto & plan = compact_read_plan();
         GGML_ASSERT(plan.size() == size_t(dst->ne[0]));
         const auto * metadata = cache->get_metadata_cache();
@@ -1075,7 +1159,7 @@ void llama_kv_cache_kvarn_context::set_input_kq_mask(
         ggml_tensor * dst,
         const llama_ubatch * ubatch,
         bool causal_attn) const {
-    if (cache->uses_compact_read_indices()) {
+    if (uses_compact_read_indices()) {
         cache->get_metadata_cache()->set_input_kq_mask_mapped(
                 dst, ubatch, causal_attn, compact_read_plan());
     } else {
@@ -1087,7 +1171,7 @@ void llama_kv_cache_kvarn_context::set_input_kq_mask_tail(
         ggml_tensor * body, ggml_tensor * exact,
         ggml_tensor * read_idxs, ggml_tensor * body_read_idxs, ggml_tensor * bias_read_idxs,
         const llama_ubatch * ubatch, bool causal_attn) const {
-    if (cache->uses_compact_read_indices()) {
+    if (uses_compact_read_indices()) {
         cache->get_metadata_cache()->set_input_kq_mask_tail_mapped(
                 body, exact, read_idxs, body_read_idxs, bias_read_idxs,
                 ubatch, causal_attn, compact_read_plan());

@@ -96,11 +96,32 @@ int main(int argc, char ** argv) {
     expect_route({256, 1, 2, 4, 4, true, false, true, true, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR,
         "Gemma-like D256 SWA decode did not select vector decode");
+    // split_max_q не задан (нулевое поле) — историческое поведение, только n_q == 1.
     for (int n_q = 2; n_q <= GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q; ++n_q) {
         expect_route({256, n_q, 6, 4, 4, false, false, false, true, false},
             GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
             "supported multi-token verification shape did not select tiled native MMA");
     }
+    // Поднятый порог пускает батченный декод на split-маршрут ровно до n_q == split_max_q.
+    expect_route({256, 1, 6, 4, 4, false, false, false, true, false, 2},
+        GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
+        "raising split_max_q must not disturb the single-token decode route");
+    expect_route({256, 2, 6, 4, 4, false, false, false, true, false, 2},
+        GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
+        "two-slot batched decode did not select split decode at split_max_q = 2");
+    expect_route({256, 3, 6, 4, 4, false, false, false, true, false, 2},
+        GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
+        "split decode leaked past split_max_q");
+    expect_route({256, 8, 6, 4, 4, false, false, false, true, false, 8},
+        GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT,
+        "draft verification shape did not select split decode at split_max_q = 8");
+    // Порог не должен обходить прочие дисквалификаторы маршрута.
+    expect_route({256, 2, 6, 4, 4, false, false, false, false, false, 8},
+        GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
+        "split_max_q overrode split ineligibility");
+    expect_route({256, 64, 6, 4, 4, false, false, false, true, true, 8},
+        GGML_CUDA_FATTN_KVARN_ROUTE_PROMPT_PREFILL,
+        "split_max_q overrode the prompt/prefill route");
     expect_route({384, 1, 6, 4, 4, false, false, false, false, false},
         GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA,
         "unsupported head shape did not remain on generic fallback");
