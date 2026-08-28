@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1.7
+# Упаковка уже собранных бинарников в runtime-образ.
+# Нужна для CI: сборка идёт отдельными задачами (лимит задачи 6 часов не
+# позволяет собрать все архитектуры CUDA за один заход), а сюда попадает
+# готовый каталог bin. Для сборки из исходников есть docker/Dockerfile.ci.
+ARG CUDA_VER=13.3.1
+ARG UBUNTU=26.04
+FROM nvidia/cuda:${CUDA_VER}-runtime-ubuntu${UBUNTU}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libcurl4t64 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# cp -a при сборке артефакта сохраняет симлинки libllama-common.so.0 (SONAME)
+# и libllama-common.so — без них бинарь не стартует.
+COPY bin/ /app/
+ENV LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH}
+WORKDIR /app
+ENTRYPOINT ["/app/llama-server"]

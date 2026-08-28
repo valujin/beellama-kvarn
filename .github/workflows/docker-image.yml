@@ -1,5 +1,23 @@
 name: Docker image (CUDA)
 
+# Сборка образа со ВСЕМИ архитектурами CUDA 13.
+#
+# Почему не одной задачей. Замерено на этом же раннере: сборка ОДНОЙ архитектуры
+# (86) занимает 137 минут при лимите задачи 6 часов. В наборе семь
+# --generate-code (четыре real и три virtual), и хотя virtual дешевле — только
+# PTX, без ptxas, — одной задачей это не укладывается. Диск при этом не мешает:
+# у раннера 145 ГБ, очистка освобождает ещё 34, сама сборка съедает 11.
+#
+# Поэтому объектные файлы разложены по шести шардам. Все шарды конфигурируют
+# сборку ОДИНАКОВО (.github/ci-configure.sh), поэтому ccache-ключи у них
+# совпадают с ключами финальной сборки: каждый шард компилирует свою долю и
+# сохраняет свой кусок кэша, а финальная задача восстанавливает все куски и
+# проходит сборку на попаданиях, оставаясь только с линковкой.
+#
+# Шардировать по АРХИТЕКТУРАМ нельзя: ccache ключует по всей командной строке,
+# включая список --generate-code, поэтому одноархитектурная компиляция не даёт
+# ни одного попадания для многоархитектурной.
+
 on:
   push:
     branches: [kvarn]
@@ -10,19 +28,15 @@ on:
       - 'common/**'
       - 'tests/**'
       - 'CMakeLists.txt'
-      - 'docker/Dockerfile.ci'
+      - 'docker/**'
+      - '.github/ci-configure.sh'
       - '.github/workflows/docker-image.yml'
   workflow_dispatch:
     inputs:
       cuda_archs:
-        description: 'CMAKE_CUDA_ARCHITECTURES (пусто — как в Dockerfile)'
+        description: 'CMAKE_CUDA_ARCHITECTURES (пусто — полный набор)'
         required: false
         default: ''
-      push_image:
-        description: 'Публиковать образ в GHCR'
-        type: boolean
-        required: false
-        default: true
 
 permissions:
   contents: read
@@ -32,122 +46,186 @@ concurrency:
   group: docker-image-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CUDA_ARCHS: ${{ inputs.cuda_archs || '75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real' }}
+  SHARDS: 6
+
 jobs:
-  build:
-    name: ${{ matrix.name }}
+  shard:
+    name: объекты ${{ matrix.shard }}/6
     runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.3.1-devel-ubuntu26.04
     timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Калибровка: одна архитектура. Нужна, чтобы знать цену сборки на
-          # четырёхъядерном раннере и уметь пересчитать её на широкий список.
-          - name: calibrate-sm86
-            archs: '86'
-            push: false
-            tag_suffix: sm86
-          # Продуктовый образ: набор, который ggml выбирает сам для CUDA 13.
-          - name: all-archs
-            archs: ''
-            push: true
-            tag_suffix: ''
-
+        shard: [1, 2, 3, 4, 5, 6]
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 6G
+      CCACHE_NOHASHDIR: '1'
+      CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
     steps:
-      - name: Освободить место на раннере
+      - name: Зависимости
         run: |
-          echo "=== до очистки ==="
-          df -h / /mnt
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL \
-            /usr/local/share/powershell \
-            /usr/share/swift \
-            /usr/local/share/chromium \
-            /usr/local/lib/node_modules \
-            /opt/az /usr/share/miniconda || true
-          sudo apt-get purge -y -qq '^llvm-.*' '^mongodb-.*' '^mysql-.*' azure-cli firefox \
-            powershell google-chrome-stable microsoft-edge-stable || true
-          sudo apt-get autoremove -y -qq || true
-          sudo docker image prune -af || true
-          echo "=== после очистки ==="
-          df -h / /mnt
-
-      - name: Перенести хранилище Docker на большой диск
-        run: |
-          # На раннере / небольшой, а /mnt — отдельный диск на несколько десятков ГБ.
-          # Сборка CUDA под несколько архитектур легко пробивает корень.
-          sudo systemctl stop docker docker.socket containerd || true
-          sudo mkdir -p /mnt/docker-data /mnt/docker-tmp
-          sudo sh -c 'cat > /etc/docker/daemon.json' <<'JSON'
-          { "data-root": "/mnt/docker-data" }
-          JSON
-          sudo systemctl start containerd docker
-          echo "DOCKER_TMPDIR=/mnt/docker-tmp" >> "$GITHUB_ENV"
-          docker info --format 'Docker Root Dir: {{.DockerRootDir}}'
-          df -h / /mnt
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates cmake ninja-build ccache git \
+            libcurl4-openssl-dev gcc-16 g++-16 gcc-15 g++-15
 
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Собрать образ
-        id: build
-        env:
-          ARCHS: ${{ github.event_name == 'workflow_dispatch' && inputs.cuda_archs != '' && inputs.cuda_archs || matrix.archs }}
-        run: |
-          set -o pipefail
-          ARGS=""
-          if [ -n "$ARCHS" ]; then
-            ARGS="--build-arg CUDA_ARCHS=$ARCHS"
-            echo "архитектуры: $ARCHS"
-          else
-            echo "архитектуры: по умолчанию (как в Dockerfile)"
-          fi
-          START=$(date +%s)
-          DOCKER_BUILDKIT=1 docker build \
-            --progress=plain \
-            -f docker/Dockerfile.ci \
-            $ARGS \
-            -t local/beellama-kvarn:build \
-            . 2>&1 | tail -n 400
-          END=$(date +%s)
-          echo "duration_min=$(( (END-START)/60 ))" >> "$GITHUB_OUTPUT"
-          echo "::notice::сборка заняла $(( (END-START)/60 )) мин"
+      - name: Восстановить свой кусок ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-shard-${{ matrix.shard }}-${{ github.sha }}
+          restore-keys: |
+            ccache-shard-${{ matrix.shard }}-
 
-      - name: Место после сборки
-        if: always()
-        run: df -h / /mnt
+      - name: Конфигурация
+        run: bash .github/ci-configure.sh
+
+      - name: Компиляция своей доли объектов
+        run: |
+          ccache -z
+          START=$(date +%s)
+          ninja -C build -t targets all | grep -oE '^[^ ]+\.o(bj)?:' | tr -d ':' | sort -u > /tmp/objs.txt
+          TOTAL=$(wc -l < /tmp/objs.txt)
+          awk -v s="${{ matrix.shard }}" -v n=6 'NR % n == (s % n)' /tmp/objs.txt > /tmp/mine.txt
+          MINE=$(wc -l < /tmp/mine.txt)
+          echo "::notice::объектов всего $TOTAL, в шарде ${{ matrix.shard }} — $MINE"
+          xargs -a /tmp/mine.txt ninja -C build
+          END=$(date +%s)
+          echo "::notice::шард ${{ matrix.shard }} собран за $(( (END-START)/60 )) мин"
+          ccache -s
+
+      - name: Сохранить свой кусок ccache
+        # На отмене и падении тоже: частично прогретый кэш ускорит следующий заход.
+        if: ${{ success() || cancelled() || failure() }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-shard-${{ matrix.shard }}-${{ github.sha }}
+
+  assemble:
+    name: сборка на прогретом кэше
+    needs: shard
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.3.1-devel-ubuntu26.04
+    timeout-minutes: 350
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 24G
+      CCACHE_NOHASHDIR: '1'
+      CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
+    steps:
+      - name: Зависимости
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates cmake ninja-build ccache git rsync \
+            libcurl4-openssl-dev gcc-16 g++-16 gcc-15 g++-15
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Куски восстанавливаются в разные каталоги и сливаются: ccache хранит
+      # объекты по содержимому, поэтому слияние безопасно.
+      - uses: actions/cache/restore@v4
+        with: { path: slice-1, key: 'ccache-shard-1-${{ github.sha }}' }
+      - uses: actions/cache/restore@v4
+        with: { path: slice-2, key: 'ccache-shard-2-${{ github.sha }}' }
+      - uses: actions/cache/restore@v4
+        with: { path: slice-3, key: 'ccache-shard-3-${{ github.sha }}' }
+      - uses: actions/cache/restore@v4
+        with: { path: slice-4, key: 'ccache-shard-4-${{ github.sha }}' }
+      - uses: actions/cache/restore@v4
+        with: { path: slice-5, key: 'ccache-shard-5-${{ github.sha }}' }
+      - uses: actions/cache/restore@v4
+        with: { path: slice-6, key: 'ccache-shard-6-${{ github.sha }}' }
+
+      - name: Слить куски ccache
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          for i in 1 2 3 4 5 6; do
+            if [ -d "slice-$i/.ccache" ]; then
+              rsync -a "slice-$i/.ccache/" "$CCACHE_DIR/"
+            elif [ -d "slice-$i" ]; then
+              rsync -a "slice-$i/" "$CCACHE_DIR/"
+            else
+              echo "::warning::кусок $i не восстановился"
+            fi
+            rm -rf "slice-$i"
+          done
+          ccache -s | head -n 20
+
+      - name: Конфигурация
+        run: bash .github/ci-configure.sh
+
+      - name: Сборка целиком
+        run: |
+          ccache -z
+          START=$(date +%s)
+          cmake --build build --config Release -j "$(nproc)" \
+            --target llama-server llama-perplexity llama-bench
+          END=$(date +%s)
+          echo "::notice::финальная сборка заняла $(( (END-START)/60 )) мин"
+          ccache -s
+
+      - name: Проверить сборку и собрать артефакт
+        run: |
+          grep -m1 -oE '\-march=[a-z0-9]+' build/compile_commands.json && \
+            { echo "::error::-march просочился в сборку"; exit 1; } || echo "-march отсутствует"
+          echo "вариантов CPU-бэкенда: $(ls build/bin | grep -c ggml-cpu)"
+          echo "=== что собрано в libggml-cuda.so ==="
+          echo -n "SASS: "
+          cuobjdump --list-elf build/bin/libggml-cuda.so \
+            | sed -nE 's/.*\.(sm_[0-9a-z]+)\.cubin$/\1/p' | sort -u | tr '\n' ' '; echo
+          echo -n "PTX:  "
+          cuobjdump --list-ptx build/bin/libggml-cuda.so \
+            | sed -nE 's/.*\.(sm_[0-9a-z]+)\.ptx$/\1/p' | sort -u | tr '\n' ' '; echo
+          mkdir -p out && cp -a build/bin/. out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin
+          path: out
+          retention-days: 3
+
+  package:
+    name: упаковка и публикация в GHCR
+    needs: assemble
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin
+          path: bin
+
+      - name: Собрать runtime-образ
+        run: |
+          chmod -R a+rX bin
+          DOCKER_BUILDKIT=1 docker build --progress=plain \
+            -f docker/Dockerfile.package -t local/beellama-kvarn:build .
 
       - name: Проверить образ
         run: |
-          echo "=== llama-server --version ==="
-          docker run --rm --entrypoint /app/llama-server local/beellama-kvarn:build --version || true
-          echo "=== варианты CPU-бэкенда ==="
+          docker run --rm --entrypoint /app/llama-server local/beellama-kvarn:build --version
           docker run --rm --entrypoint sh local/beellama-kvarn:build -c 'ls /app | grep -c ggml-cpu'
-          echo "=== что собрано в libggml-cuda.so ==="
-          # cuobjdump живёт только в devel-образе, поэтому вытаскиваем библиотеку наружу
-          CID=$(docker create local/beellama-kvarn:build)
-          docker cp "$CID:/app/libggml-cuda.so" /mnt/libggml-cuda.so
-          docker rm "$CID" >/dev/null
-          docker run --rm -v /mnt/libggml-cuda.so:/x.so:ro \
-            nvidia/cuda:13.3.1-devel-ubuntu26.04 \
-            bash -c 'cuobjdump --list-elf /x.so | sed -E "s/.*\\.(sm_[0-9]+)\\..*/\\1/" | sort -u | tr "\\n" " "; echo; \
-                     echo "--- PTX ---"; \
-                     cuobjdump --list-ptx /x.so | sed -E "s/.*\\.(compute_[0-9]+)\\..*/\\1/" | sort -u | tr "\\n" " "; echo'
-          rm -f /mnt/libggml-cuda.so
 
       - name: Войти в GHCR
-        if: ${{ matrix.push && (github.event_name != 'workflow_dispatch' || inputs.push_image) }}
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
-      - name: Опубликовать в GHCR
-        if: ${{ matrix.push && (github.event_name != 'workflow_dispatch' || inputs.push_image) }}
+      - name: Опубликовать
         run: |
           REPO=ghcr.io/${GITHUB_REPOSITORY,,}
           SHA=${GITHUB_SHA::12}
