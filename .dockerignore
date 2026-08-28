@@ -1,11 +1,11 @@
+# Каталоги .github/, models/ и файл .gitignore НЕ исключаются намеренно:
+# без них дерево внутри сборки расходится с git и версия образа получает
+# помету -dirty, а tests/ читают и .github/workflows/release.yml, и
+# models/ggml-vocab-*.gguf.
 *.o
 *.a
 .cache/
 # Do not ignore .git directory, otherwise the reported build number will always be 0
-.github/
-# release.yml читает tests/test-cuda-fattn-route-policy.cpp
-!.github/workflows/release.yml
-.gitignore
 .vs/
 .vscode/
 .DS_Store
@@ -14,7 +14,6 @@ build*/
 
 tools/ui/node_modules/
 
-models/*
 
 /llama-cli
 /llama-quantize
