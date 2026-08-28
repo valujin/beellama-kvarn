@@ -1,0 +1,158 @@
+name: Docker image (CUDA)
+
+on:
+  push:
+    branches: [kvarn]
+    paths:
+      - 'ggml/**'
+      - 'src/**'
+      - 'tools/**'
+      - 'common/**'
+      - 'tests/**'
+      - 'CMakeLists.txt'
+      - 'docker/Dockerfile.ci'
+      - '.github/workflows/docker-image.yml'
+  workflow_dispatch:
+    inputs:
+      cuda_archs:
+        description: 'CMAKE_CUDA_ARCHITECTURES (пусто — как в Dockerfile)'
+        required: false
+        default: ''
+      push_image:
+        description: 'Публиковать образ в GHCR'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Калибровка: одна архитектура. Нужна, чтобы знать цену сборки на
+          # четырёхъядерном раннере и уметь пересчитать её на широкий список.
+          - name: calibrate-sm86
+            archs: '86'
+            push: false
+            tag_suffix: sm86
+          # Продуктовый образ: набор, который ggml выбирает сам для CUDA 13.
+          - name: all-archs
+            archs: ''
+            push: true
+            tag_suffix: ''
+
+    steps:
+      - name: Освободить место на раннере
+        run: |
+          echo "=== до очистки ==="
+          df -h / /mnt
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /usr/local/share/chromium \
+            /usr/local/lib/node_modules \
+            /opt/az /usr/share/miniconda || true
+          sudo apt-get purge -y -qq '^llvm-.*' '^mongodb-.*' '^mysql-.*' azure-cli firefox \
+            powershell google-chrome-stable microsoft-edge-stable || true
+          sudo apt-get autoremove -y -qq || true
+          sudo docker image prune -af || true
+          echo "=== после очистки ==="
+          df -h / /mnt
+
+      - name: Перенести хранилище Docker на большой диск
+        run: |
+          # На раннере / небольшой, а /mnt — отдельный диск на несколько десятков ГБ.
+          # Сборка CUDA под несколько архитектур легко пробивает корень.
+          sudo systemctl stop docker docker.socket containerd || true
+          sudo mkdir -p /mnt/docker-data /mnt/docker-tmp
+          sudo sh -c 'cat > /etc/docker/daemon.json' <<'JSON'
+          { "data-root": "/mnt/docker-data" }
+          JSON
+          sudo systemctl start containerd docker
+          echo "DOCKER_TMPDIR=/mnt/docker-tmp" >> "$GITHUB_ENV"
+          docker info --format 'Docker Root Dir: {{.DockerRootDir}}'
+          df -h / /mnt
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Собрать образ
+        id: build
+        env:
+          ARCHS: ${{ github.event_name == 'workflow_dispatch' && inputs.cuda_archs != '' && inputs.cuda_archs || matrix.archs }}
+        run: |
+          set -o pipefail
+          ARGS=""
+          if [ -n "$ARCHS" ]; then
+            ARGS="--build-arg CUDA_ARCHS=$ARCHS"
+            echo "архитектуры: $ARCHS"
+          else
+            echo "архитектуры: по умолчанию (как в Dockerfile)"
+          fi
+          START=$(date +%s)
+          DOCKER_BUILDKIT=1 docker build \
+            --progress=plain \
+            -f docker/Dockerfile.ci \
+            $ARGS \
+            -t local/beellama-kvarn:build \
+            . 2>&1 | tail -n 400
+          END=$(date +%s)
+          echo "duration_min=$(( (END-START)/60 ))" >> "$GITHUB_OUTPUT"
+          echo "::notice::сборка заняла $(( (END-START)/60 )) мин"
+
+      - name: Место после сборки
+        if: always()
+        run: df -h / /mnt
+
+      - name: Проверить образ
+        run: |
+          echo "=== llama-server --version ==="
+          docker run --rm --entrypoint /app/llama-server local/beellama-kvarn:build --version || true
+          echo "=== варианты CPU-бэкенда ==="
+          docker run --rm --entrypoint sh local/beellama-kvarn:build -c 'ls /app | grep -c ggml-cpu'
+          echo "=== что собрано в libggml-cuda.so ==="
+          # cuobjdump живёт только в devel-образе, поэтому вытаскиваем библиотеку наружу
+          CID=$(docker create local/beellama-kvarn:build)
+          docker cp "$CID:/app/libggml-cuda.so" /mnt/libggml-cuda.so
+          docker rm "$CID" >/dev/null
+          docker run --rm -v /mnt/libggml-cuda.so:/x.so:ro \
+            nvidia/cuda:13.3.1-devel-ubuntu26.04 \
+            bash -c 'cuobjdump --list-elf /x.so | sed -E "s/.*\\.(sm_[0-9]+)\\..*/\\1/" | sort -u | tr "\\n" " "; echo; \
+                     echo "--- PTX ---"; \
+                     cuobjdump --list-ptx /x.so | sed -E "s/.*\\.(compute_[0-9]+)\\..*/\\1/" | sort -u | tr "\\n" " "; echo'
+          rm -f /mnt/libggml-cuda.so
+
+      - name: Войти в GHCR
+        if: ${{ matrix.push && (github.event_name != 'workflow_dispatch' || inputs.push_image) }}
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Опубликовать в GHCR
+        if: ${{ matrix.push && (github.event_name != 'workflow_dispatch' || inputs.push_image) }}
+        run: |
+          REPO=ghcr.io/${GITHUB_REPOSITORY,,}
+          SHA=${GITHUB_SHA::12}
+          docker tag local/beellama-kvarn:build "$REPO:$SHA"
+          docker tag local/beellama-kvarn:build "$REPO:latest"
+          docker push "$REPO:$SHA"
+          docker push "$REPO:latest"
+          echo "::notice::опубликовано $REPO:latest и $REPO:$SHA"

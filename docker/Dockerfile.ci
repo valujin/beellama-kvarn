@@ -1,0 +1,95 @@
+# syntax=docker/dockerfile:1.7
+#
+# Сборка beellama-kvarn прямо из дерева репозитория.
+#
+#   docker build -f docker/Dockerfile.ci -t beellama-kvarn:local .
+#
+# Устройство повторяет сборку, на которой снимались все замеры форка:
+# CUDA 13.3 на Ubuntu 26.04, GCC 16 для процессорного кода и GCC 15 для
+# host-части nvcc (официальный образ cuda13 собран на Ubuntu 24.04 с GCC 13).
+#
+# ВАЖНО: GGML_NATIVE=OFF намеренно. Проверено замером на мейнлайне:
+# -march=native делает CPU-ядра llama.cpp примерно на 40% МЕДЛЕННЕЕ, потому что
+# ядра написаны интринсиками, а варианты собираются явными флагами фич с обычным
+# -mtune и выбираются в рантайме. Нативная сборка ломает этот механизм и заодно
+# портит решения автовекторизатора. Поэтому здесь тот же подход, что у апстрима:
+# GGML_CPU_ALL_VARIANTS + GGML_BACKEND_DL.
+#
+# CUDA_ARCHS по умолчанию — ровно тот список, который ggml выбирает сам для
+# CUDA 13 при GGML_NATIVE=OFF (ggml/src/ggml-cuda/CMakeLists.txt):
+#   75-virtual  PTX для Turing и выше; им же JIT-ом покрываются 87, 88, 100,
+#               103, 110 — все архитектуры CUDA 13, у которых нет своего SASS
+#   80-virtual  PTX Ampere-datacenter
+#   86-real     SASS RTX 3000 / A10
+#   89-real     SASS RTX 4000 / L4 / L40S
+#   90-virtual  PTX Hopper
+#   120a-real   SASS Blackwell
+#   121a-real   SASS Blackwell (RTX 50 Laptop / Thor)
+# Одна карта собирается кратно быстрее: --build-arg CUDA_ARCHS=86
+
+ARG CUDA_VER=13.3.1
+ARG UBUNTU=26.04
+
+FROM nvidia/cuda:${CUDA_VER}-devel-ubuntu${UBUNTU} AS build
+ARG GCC_CPU=16
+ARG GCC_CUDA=15
+ARG BUILD_JOBS=""
+ARG CUDA_ARCHS="75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git cmake ninja-build ccache libcurl4-openssl-dev ca-certificates \
+        gcc-${GCC_CPU} g++-${GCC_CPU} gcc-${GCC_CUDA} g++-${GCC_CUDA} \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . /src
+
+# Политика маршрутов — чистая функция без зависимостей от CUDA, но тест сверяет
+# её ещё и с исходниками бэкенда и с release.yml, поэтому ему нужно всё дерево.
+# Отдельным слоем до многоминутной сборки ядер, а не после.
+RUN g++ -std=c++17 -O0 -o /tmp/rp-test tests/test-cuda-fattn-route-policy.cpp \
+    && /tmp/rp-test /src && echo "тест маршрутов пройден"
+
+RUN --mount=type=cache,target=/ccache,sharing=locked \
+    CCACHE_DIR=/ccache CCACHE_MAXSIZE=12G \
+    cmake -B build -G Ninja \
+        -DCMAKE_C_COMPILER=gcc-${GCC_CPU} \
+        -DCMAKE_CXX_COMPILER=g++-${GCC_CPU} \
+        -DCMAKE_CUDA_HOST_COMPILER=g++-${GCC_CUDA} \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+        "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined -L/usr/local/cuda/lib64/stubs" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGGML_CUDA=ON \
+        "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" \
+        -DGGML_CUDA_FA_ALL_QUANTS=ON \
+        -DGGML_NATIVE=OFF \
+        -DGGML_CPU_ALL_VARIANTS=ON \
+        -DGGML_BACKEND_DL=ON \
+        -DBUILD_SHARED_LIBS=ON \
+        -DLLAMA_CURL=ON \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_TOOLS=ON \
+    && CCACHE_DIR=/ccache CCACHE_MAXSIZE=12G \
+       cmake --build build --config Release -j "${BUILD_JOBS:-$(nproc)}" \
+        --target llama-server llama-perplexity llama-bench \
+    && CCACHE_DIR=/ccache ccache --show-stats
+
+# Проверка, что -march=native не просочился, и сбор артефактов.
+# Каталог bin копируется целиком через cp -a: рядом с настоящим
+# libllama-common.so.0.4.4 лежат симлинки libllama-common.so.0 (SONAME) и
+# libllama-common.so, без них бинарь не стартует; find -type f их отбрасывает.
+RUN (grep -m1 -oE '\-march=[a-z0-9]+' build/compile_commands.json || echo "-march отсутствует") \
+    && mkdir -p /out && cp -a build/bin/. /out/ \
+    && ls /out | grep -c 'ggml-cpu' | xargs echo "вариантов CPU-бэкенда:"
+
+FROM nvidia/cuda:${CUDA_VER}-runtime-ubuntu${UBUNTU}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libcurl4t64 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/ /app/
+ENV LD_LIBRARY_PATH=/app:${LD_LIBRARY_PATH}
+WORKDIR /app
+ENTRYPOINT ["/app/llama-server"]

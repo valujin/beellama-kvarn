@@ -3,6 +3,8 @@
 .cache/
 # Do not ignore .git directory, otherwise the reported build number will always be 0
 .github/
+# release.yml читает tests/test-cuda-fattn-route-policy.cpp
+!.github/workflows/release.yml
 .gitignore
 .vs/
 .vscode/
