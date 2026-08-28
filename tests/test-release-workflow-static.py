@@ -18,6 +18,9 @@ def main() -> None:
         "release-dispatch.yml",
         "release-preview-dispatch.yml",
         "release.yml",
+        # Сборка docker-образа этого форка. Тест сторожит перечень от случайно
+        # заведённых workflow, а этот заведён намеренно (docs/Dockerfile.ci).
+        "docker-image.yml",
     }
     actual = {path.name for path in WORKFLOWS.glob("*.y*ml")}
     require(
