@@ -421,6 +421,21 @@ endif()
 add_test(NAME test-kvarn WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn>)
 set_property(TEST test-kvarn PROPERTY LABELS main)
 
+# Ширина тайла строк запроса читается из GGML_KVARN_Q_TILE один раз на процесс,
+# поэтому перебрать её внутри одного прогона нельзя. На формах основной матрицы
+# оценка кандидатов всегда выбирает тайл 1 (n_kv = 1024 даёт одну волну), так
+# что без этих двух записей ядра с Q_TILE 2 и 3 не исполняются ни одним тестом.
+# При заданной переменной test-kvarn выполняет только матрицу split-декода:
+# однотокенные формы остального набора при принудительном широком тайле
+# законно уходят на generic MMA.
+foreach (KVARN_Q_TILE 2 3)
+    add_test(NAME test-kvarn-q-tile-${KVARN_Q_TILE}
+             WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kvarn>)
+    set_property(TEST test-kvarn-q-tile-${KVARN_Q_TILE} PROPERTY LABELS main)
+    set_property(TEST test-kvarn-q-tile-${KVARN_Q_TILE} PROPERTY
+                 ENVIRONMENT GGML_KVARN_Q_TILE=${KVARN_Q_TILE})
+endforeach()
+
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})

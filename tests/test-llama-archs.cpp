@@ -772,6 +772,13 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
 
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
+    // При GGML_BACKEND_DL=ON бэкенды лежат отдельными разделяемыми
+    // библиотеками и сами не регистрируются: без этой строки
+    // llama_model_load_from_file_impl отвечает "no backends are loaded", и
+    // test-generate-models вместе с test-mtp-ubatch-sync падают, а зависящие от
+    // них test-recurrent-state-rollback* даже не запускаются. common_init()
+    // настраивает только журнал.
+    ggml_backend_load_all();
     common_init();
     std::random_device rd;
 

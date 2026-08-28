@@ -38,7 +38,12 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     const int stderr_fd = fileno(stderr);
     const int saved_fd  = dup(stderr_fd);
     assert(saved_fd >= 0);
-    assert(dup2(fileno(capture), stderr_fd) == 0);
+    // POSIX dup2 возвращает НОВЫЙ дескриптор, а не ноль (ноль возвращает
+    // майкрософтовский _dup2, откуда сравнение и списано). На Linux stderr_fd
+    // равен двум, сравнение с нулём всегда ложно, и весь набор падал здесь
+    // молча: сообщение assert уходило в тот самый временный файл, на который
+    // подменялся stderr.
+    assert(dup2(fileno(capture), stderr_fd) == stderr_fd);
 #endif
 
     fn();
@@ -55,7 +60,7 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     assert(_dup2(saved_fd, stderr_fd) == 0);
     _close(saved_fd);
 #else
-    assert(dup2(saved_fd, stderr_fd) == 0);
+    assert(dup2(saved_fd, stderr_fd) == stderr_fd);
     close(saved_fd);
 #endif
     fclose(capture);
