@@ -966,7 +966,8 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
         int stage_groups,
         bool emit_rotated = false,
         bool swa = false,
-        int head_slices = 1) {
+        int head_slices = 1,
+        bool eager_records = false) {
     require(records->type == GGML_TYPE_I8, "reference decode records type mismatch");
     require(stage->type == GGML_TYPE_F16, "reference decode stage type mismatch");
     require(stage->ne[0] == 128, "reference decode stage width mismatch");
@@ -998,19 +999,31 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
     ggml_backend_tensor_get(records, record_data.data(), 0, record_data.size());
 
     std::vector<int64_t> live_groups(n_stream, 0);
+    // Позиция внутри живой группы нужна только правилу eager: там завершённая
+    // группа читается из записей, а из стейджа - только незавершённая.
+    std::vector<int64_t> live_positions(n_stream, 0);
     for (int64_t idx : indices) {
         if (idx < 0) {
             require(swa, "reference decode negative non-SWA index");
             continue;
         }
         const int64_t group_global = idx / 128;
+        const int64_t pos = idx % 128;
         if (swa) {
-            live_groups[0] = std::max(live_groups[0], group_global);
+            if (group_global > live_groups[0] || (group_global == live_groups[0] && pos > live_positions[0])) {
+                live_groups[0]    = group_global;
+                live_positions[0] = pos;
+            }
         } else {
             const int64_t stream = group_global / groups_per_stream;
             if (stream >= stream_start && stream < stream_start + n_stream) {
                 const int64_t group = group_global - stream * groups_per_stream;
-                live_groups[stream - stream_start] = std::max(live_groups[stream - stream_start], group);
+                int64_t & live_group = live_groups[stream - stream_start];
+                int64_t & live_pos   = live_positions[stream - stream_start];
+                if (group > live_group || (group == live_group && pos > live_pos)) {
+                    live_group = group;
+                    live_pos   = pos;
+                }
             }
         }
     }
@@ -1038,7 +1051,26 @@ static std::vector<ggml_fp16_t> test_kvarn_reference_decode(
                 bool from_record;
                 int64_t stage_pos = 0;
                 int64_t record_group = 0;
-                if (swa) {
+                if (eager_records) {
+                    // Правило продуктового пути чтения (ggml-cuda/kvarn.cu,
+                    // ветка eager_records в kvarn_materialize_kernel): из
+                    // стейджа берутся только якорная группа 0 и живая
+                    // НЕЗАВЕРШЁННАЯ группа, всё завершённое - из записей.
+                    // Правила ниже описывают поведение до eager-печати; на
+                    // eager-сторах они дают ложное расхождение, потому что
+                    // завершённая группа в стейдж больше не пишется.
+                    const int64_t live_pos = live_positions[out_stream];
+                    const bool completed = group < live_group ||
+                                           (group == live_group && live_pos == 127);
+                    from_stage  = (!swa && group == 0) || (group == live_group && live_pos < 127);
+                    from_record = !from_stage && completed && (swa ?
+                                  (group >= 0 && live_group - group < groups_per_stream) :
+                                  (group > 0 && group < groups_per_stream));
+                    stage_pos    = stage_base + (swa ? (group % stage_groups) :
+                                   (group == 0 ? 0 : 1 + ((group - 1) % tail_groups))) * 128 + pos;
+                    record_group = (int64_t) stream * groups_per_stream +
+                                   (swa ? group % groups_per_stream : group);
+                } else if (swa) {
                     from_stage  = group >= stage_begin && group <= live_group;
                     from_record = !from_stage && group >= 0 && group < stage_begin &&
                                   (live_group - group) < groups_per_stream + tail_groups;
@@ -1123,9 +1155,11 @@ static std::vector<float> test_kvarn_reference_decode_f32(
         int stage_groups,
         bool emit_rotated = false,
         bool swa = false,
-        int head_slices = 1) {
+        int head_slices = 1,
+        bool eager_records = false) {
     std::vector<ggml_fp16_t> output_f16 = test_kvarn_reference_decode(
-            records, stage, indices, n_kv, stream_start, n_stream, bits, value, stage_groups, emit_rotated, swa, head_slices);
+            records, stage, indices, n_kv, stream_start, n_stream, bits, value, stage_groups, emit_rotated, swa, head_slices,
+            eager_records);
     std::vector<float> output(output_f16.size());
     ggml_fp16_to_fp32_row(output_f16.data(), output.data(), output.size());
     return output;
@@ -1783,7 +1817,8 @@ static std::vector<ggml_fp16_t> test_store_segmented_output(
         full_indices[t] = t;
     }
     std::vector<ggml_fp16_t> output = test_kvarn_reference_decode(
-            records, stored, full_indices, total_tokens, 0, n_stream, bits, value, stage_groups, false, swa, head_slices);
+            records, stored, full_indices, total_tokens, 0, n_stream, bits, value, stage_groups, false, swa, head_slices,
+            eager_records);
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -4339,7 +4374,8 @@ static void test_eager_unaligned_start(enum ggml_backend_dev_type device_type, b
     }
 
     const std::vector<float> output = test_kvarn_reference_decode_f32(
-            records, stored, idx, total_tokens, 0, 1, bits, false, stage_groups);
+            records, stored, idx, total_tokens, 0, 1, bits, false, stage_groups,
+            /*emit_rotated =*/ false, /*swa =*/ false, /*head_slices =*/ 1, /*eager_records =*/ true);
 
     double mse = 0.0;
     double max_diff = 0.0;
@@ -4366,6 +4402,240 @@ static void test_eager_unaligned_start(enum ggml_backend_dev_type device_type, b
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
+// Детерминированный стенд: сквозная запись стейджа портит живую незавершённую
+// группу чужой последовательности.
+//
+// Незавершённая группа из 128 токенов живёт ТОЛЬКО в буфере F16 (стейдже), её
+// место там - арифметика по номеру группы: slot(g) = (g == 0) ? 0 : 1 + ((g-1) %
+// tail_groups). При stage_groups = 3 получается tail_groups = 2, то есть группы
+// 1 и 3 садятся в один и тот же слот 1. Это самая короткая пара для опыта.
+//
+//   шаг А  64 токена в ячейки 128..191  -> группа 1 живая, 64/128, слот 1
+//   шаг Б  384 токена в ячейки 256..639 -> группы 2, 3 и 4 целиком внутри стора;
+//                                          384 >= 3 * 128, поэтому стор идёт по
+//                                          непрерывной workspace-ветке
+//   шаг В  64 токена в ячейки 192..255  -> группа 1 дозаполнена и запечатана из
+//                                          слота 1
+//
+// Группы 2, 3 и 4 запечатываются прямо из рабочего буфера (сшивающее ядро читает
+// workspace на всём диапазоне [start_local, end_local)), их строки F16 после
+// стора не нужны никому. Прежнее поведение (GGML_KVARN_STAGE_PASSTHROUGH=1) всё
+// равно выбирало для каждого слота кольца последнюю попавшую в него группу стора
+// и писало её строки: группа 3 ложилась в слот 1 поверх живых строк группы 1.
+// Шаг В запекает эту порчу в запись группы 1 навсегда.
+//
+// Опыт детерминирован: один граф ggml, один поток, порядок сторов задан
+// зависимостью по данным (выход предыдущего стора - вход стейджа следующего).
+struct kvarn_stage_write_through_probe {
+    std::vector<float>       decoded;    // n_kv * 128, n_heads == 1
+    std::vector<ggml_fp16_t> live_rows;  // живые строки слота 1 (64 * 128)
+    bool                     stats_known = false;
+    uint64_t                 workspace_stores = 0;
+    uint64_t                 per_token_stores = 0;
+};
+
+static kvarn_stage_write_through_probe kvarn_run_stage_write_through(
+        ggml_backend_t backend, int bits, bool with_long_store) {
+    constexpr int n_heads           = 1;
+    constexpr int stage_groups      = 3;                  // tail_groups = 2
+    constexpr int tail_groups       = stage_groups - 1;
+    constexpr int groups_per_stream = 8;
+    constexpr int victim_group      = 1;
+    constexpr int victim_half       = 64;
+    constexpr int victim_start      = victim_group * 128; // 128
+    constexpr int long_start        = 256;                // начало группы 2
+    constexpr int long_tokens       = 3 * 128;            // группы 2, 3, 4
+    constexpr int n_kv              = long_start + long_tokens; // 640
+    constexpr int probe_group       = 7;                  // "последовательность ушла вперёд"
+
+    static_assert(1 + ((victim_group - 1) % tail_groups) == 1 + ((3 - 1) % tail_groups),
+            "стенд бессмыслен: группы 1 и 3 обязаны делить один слот стейджа");
+
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 8 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "stage-write-through: failed to initialize ggml context");
+
+    ggml_tensor * stage   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 128 * stage_groups);
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, groups_per_stream);
+
+    ggml_tensor * current_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, victim_half);
+    ggml_tensor * indices_a = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, victim_half);
+    ggml_tensor * current_b = with_long_store ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, long_tokens) : nullptr;
+    ggml_tensor * indices_b = with_long_store ? ggml_new_tensor_1d(ctx, GGML_TYPE_I64, long_tokens) : nullptr;
+    ggml_tensor * current_c = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, victim_half);
+    ggml_tensor * indices_c = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, victim_half);
+
+    // op_params[3] - подсказка tokens_per_stream, op_params[9] - eager-печать
+    // записей; и то и другое кэш KVarN всегда проставляет сам.
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current_a, indices_a, stage, records, bits, 16, false, stage_groups);
+    stored->op_params[3] = victim_half;
+    stored->op_params[9] = 1;
+    if (with_long_store) {
+        stored = ggml_kvarn_store(ctx, current_b, indices_b, stored, records, bits, 16, false, stage_groups);
+        stored->op_params[3] = long_tokens;
+        stored->op_params[9] = 1;
+    }
+    stored = ggml_kvarn_store(ctx, current_c, indices_c, stored, records, bits, 16, false, stage_groups);
+    stored->op_params[3] = victim_half;
+    stored->op_params[9] = 1;
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, stored);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "stage-write-through: failed to allocate tensors");
+
+    // Значения сильно зависят от абсолютной позиции по каждому измерению, иначе
+    // подмена группы 1 на группу 3 была бы неотличима от шума квантования.
+    auto sample = [](int abs_pos, int d) {
+        return std::sin(float(d) * 0.071f + float(abs_pos) * 0.113f) +
+               0.5f * std::cos(float(d) * 0.031f - float(abs_pos) * 0.047f);
+    };
+
+    auto fill = [&](ggml_tensor * current, ggml_tensor * indices, int first_cell, int n) {
+        std::vector<float>   data((size_t) 128 * n_heads * n);
+        std::vector<int64_t> idx(n);
+        for (int t = 0; t < n; ++t) {
+            idx[t] = int64_t(first_cell + t);
+            for (int d = 0; d < 128; ++d) {
+                data[(size_t) t * 128 + d] = sample(first_cell + t, d);
+            }
+        }
+        ggml_backend_tensor_set(current, data.data(), 0, ggml_nbytes(current));
+        ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    };
+
+    std::vector<uint8_t> stage_zeros(ggml_nbytes(stage), 0);
+    std::vector<uint8_t> record_zeros(ggml_nbytes(records), 0);
+    ggml_backend_tensor_set(stage, stage_zeros.data(), 0, stage_zeros.size());
+    ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
+
+    fill(current_a, indices_a, victim_start, victim_half);
+    if (with_long_store) {
+        fill(current_b, indices_b, long_start, long_tokens);
+    }
+    fill(current_c, indices_c, victim_start + victim_half, victim_half);
+
+    kvarn_stage_write_through_probe probe;
+    const auto [store_stats_reset, store_stats_get] = get_kvarn_store_route_stats_fns(backend);
+    if (store_stats_reset != nullptr && store_stats_get != nullptr) {
+        store_stats_reset();
+    }
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
+            "stage-write-through: graph compute failed");
+
+    if (store_stats_reset != nullptr && store_stats_get != nullptr) {
+        test_kvarn_store_route_stats stats = make_test_kvarn_store_route_stats();
+        store_stats_get(&stats);
+        probe.stats_known       = true;
+        probe.workspace_stores  = stats.single_slice_workspace + stats.headwide_workspace;
+        probe.per_token_stores  = stats.high_shared_fallback + stats.low_shared_store;
+    }
+
+    // Живые строки незавершённой группы 1 лежат в слоте 1 стейджа, строки
+    // [128, 128 + 64) по третьему измерению.
+    std::vector<ggml_fp16_t> stage_data(ggml_nelements(stage));
+    ggml_backend_tensor_get(stage, stage_data.data(), 0, ggml_nbytes(stage));
+    const size_t slot_base = (size_t) 128 * 128 * n_heads;
+    probe.live_rows.assign(stage_data.begin() + ptrdiff_t(slot_base),
+                           stage_data.begin() + ptrdiff_t(slot_base + (size_t) victim_half * 128 * n_heads));
+
+    // Читаем так, как читал бы сервер после того, как последовательность ушла
+    // вперёд: живой считается группа 7, значит группы 1..4 берутся из записей.
+    const std::vector<int64_t> probe_indices = { int64_t(probe_group) * 128 };
+    probe.decoded = test_kvarn_reference_decode_f32(
+            records, stored, probe_indices, n_kv, 0, 1, bits, false, stage_groups,
+            /*emit_rotated =*/ false, /*swa =*/ false, /*head_slices =*/ 1, /*eager_records =*/ true);
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return probe;
+}
+
+static void test_stage_write_through_live_group(enum ggml_backend_dev_type device_type, bool required, int bits) {
+    ggml_backend_t backend = init_test_backend(device_type, required);
+    if (backend == nullptr) {
+        return;
+    }
+
+    constexpr int victim_start = 128;
+    constexpr int victim_end   = 256;   // группа 1 целиком
+    constexpr int others_end    = 640;  // группы 2, 3, 4
+
+    const kvarn_stage_write_through_probe quiet   = kvarn_run_stage_write_through(backend, bits, false);
+    const kvarn_stage_write_through_probe crossed = kvarn_run_stage_write_through(backend, bits, true);
+
+    auto sample = [](int abs_pos, int d) {
+        return std::sin(float(d) * 0.071f + float(abs_pos) * 0.113f) +
+               0.5f * std::cos(float(d) * 0.031f - float(abs_pos) * 0.047f);
+    };
+    auto range_rmse = [&](const std::vector<float> & decoded, int first_cell, int last_cell) {
+        double mse = 0.0;
+        for (int cell = first_cell; cell < last_cell; ++cell) {
+            for (int d = 0; d < 128; ++d) {
+                const double diff = double(sample(cell, d)) - double(decoded[(size_t) cell * 128 + d]);
+                mse += diff * diff;
+            }
+        }
+        return std::sqrt(mse / double((last_cell - first_cell) * 128));
+    };
+
+    size_t changed  = 0;
+    double max_diff = 0.0;
+    for (size_t i = 0; i < crossed.live_rows.size(); ++i) {
+        if (crossed.live_rows[i] != quiet.live_rows[i]) {
+            ++changed;
+        }
+        max_diff = std::max(max_diff,
+                std::fabs(double(ggml_fp16_to_fp32(crossed.live_rows[i])) -
+                          double(ggml_fp16_to_fp32(quiet.live_rows[i]))));
+    }
+
+    const double victim_rmse = range_rmse(crossed.decoded, victim_start, victim_end);
+    const double others_rmse = range_rmse(crossed.decoded, victim_end,  others_end);
+    const double quiet_rmse  = range_rmse(quiet.decoded,   victim_start, victim_end);
+    const double limit = 0.15;
+
+    // Разбор опыта печатается целиком, чтобы падение сразу давало числа обеих
+    // проверок, а не только первой.
+    const bool route_bad = crossed.stats_known &&
+            (crossed.workspace_stores != 1 || crossed.per_token_stores != 2 || quiet.workspace_stores != 0);
+    const bool stage_bad = changed != 0;
+    const bool read_bad  = !std::isfinite(victim_rmse) || victim_rmse >= limit ||
+                           !std::isfinite(others_rmse) || others_rmse >= limit ||
+                           !std::isfinite(quiet_rmse)  || quiet_rmse  >= limit;
+    // Подспорье для разбора: KVARN_STAGE_WRITE_THROUGH_SOFT=1 печатает всю
+    // матрицу вместо остановки на первом падении, KVARN_STAGE_WRITE_THROUGH_REPORT=1
+    // печатает числа и на зелёном прогоне.
+    const bool soft = std::getenv("KVARN_STAGE_WRITE_THROUGH_SOFT") != nullptr;
+    if (route_bad || stage_bad || read_bad || soft ||
+            std::getenv("KVARN_STAGE_WRITE_THROUGH_REPORT") != nullptr) {
+        std::fprintf(stderr,
+                "stage-write-through[bits=%d]: маршрут длинного стора workspace=%llu per-token=%llu "
+                "(контроль workspace=%llu); живые строки F16 группы 1 изменены в %zu из %zu значений, "
+                "максимальное расхождение %g; чтение после дозаполнения: группа 1 rmse=%g, "
+                "группы 2..4 rmse=%g, контроль без чужого стора rmse=%g, порог %g\n",
+                bits,
+                (unsigned long long) crossed.workspace_stores,
+                (unsigned long long) crossed.per_token_stores,
+                (unsigned long long) quiet.workspace_stores,
+                changed, crossed.live_rows.size(), max_diff,
+                victim_rmse, others_rmse, quiet_rmse, limit);
+    }
+    require(soft || !route_bad, "stage-write-through: длинный стор не попал в непрерывную workspace-ветку");
+    require(soft || !stage_bad, "stage-write-through: сквозная запись стейджа затёрла живую незавершённую группу");
+    require(soft || !read_bad,  "stage-write-through: порча живой группы дожила до чтения записи");
+
     ggml_backend_free(backend);
 }
 
@@ -4903,6 +5173,12 @@ int main() {
             test_eager_unaligned_start(GGML_BACKEND_DEVICE_TYPE_CPU, true,  start, n, 6);
             test_eager_unaligned_start(GGML_BACKEND_DEVICE_TYPE_GPU, false, start, n, 6);
         }
+    }
+    // Сквозная запись стейджа: длинный непрерывный стор не имеет права трогать
+    // строки F16 живой незавершённой группы чужой последовательности.
+    // GGML_KVARN_STAGE_PASSTHROUGH=1 возвращает прежнее поведение, и тест падает.
+    for (int bits : { 6, 8 }) {
+        test_stage_write_through_live_group(GGML_BACKEND_DEVICE_TYPE_GPU, false, bits);
     }
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6);
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);
