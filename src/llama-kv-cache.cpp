@@ -2362,6 +2362,29 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         for (uint32_t cell = 0; cell < cells.size(); ++cell) {
             group_used[cell/allocation_group_size] += !cells.is_empty(cell);
         }
+        // Ячейки, зарезервированные ЭТИМ же вызовом, для cells ещё пусты,
+        // поэтому проверка совместимости ниже их не видит. Здесь запоминается
+        // токен, первым занявший группу в текущем вызове, чтобы сравнить с ним
+        // набор последовательностей следующего кандидата.
+        std::vector<int32_t> group_claim(n_groups, -1);
+        auto same_seq_set = [&](uint32_t a, uint32_t b) {
+            if (ubatch.n_seq_id[a] != ubatch.n_seq_id[b]) {
+                return false;
+            }
+            for (int32_t x = 0; x < ubatch.n_seq_id[a]; ++x) {
+                bool matched = false;
+                for (int32_t y = 0; y < ubatch.n_seq_id[b]; ++y) {
+                    if (ubatch.seq_id[a][x] == ubatch.seq_id[b][y]) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    return false;
+                }
+            }
+            return true;
+        };
         std::vector<int32_t> stage_owners(allocation_stage_groups + 1u, -1);
         auto stage_slot = [&](uint32_t group) {
             return group == 0 ? 0u : 1u + ((group - 1u)%allocation_stage_groups);
@@ -2469,6 +2492,18 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     continue;
                 }
 
+                // Группа, уже занятая в этом вызове ДРУГИМ набором
+                // последовательностей, несовместима: иначе один шаг
+                // декодирования складывает токены четырёх последовательностей
+                // в одну группу, на следующем шаге она несовместима уже ни с
+                // одной из них, остаётся навсегда незавершённой и держит слот
+                // F16. Через tail_groups шагов кольцо слотов кончается и
+                // find_slot возвращает пусто при почти пустом кэше.
+                if (group_claim[group] >= 0 &&
+                        !same_seq_set(uint32_t(group_claim[group]), i)) {
+                    continue;
+                }
+
                 bool compatible = true;
                 const uint32_t group_begin = group*allocation_group_size;
                 const uint32_t group_end = std::min<uint32_t>(
@@ -2521,6 +2556,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
                 res.idxs[0].push_back(idx);
                 reserved[idx] = true;
+                if (group_claim[group] < 0) {
+                    group_claim[group] = int32_t(i);
+                }
                 if (++group_used[group] == allocation_group_size && group > 0) {
                     allocation_group_sealed[group] = 1;
                     // Слот отпускается сразу: сшивающее ядро (flush) читает
