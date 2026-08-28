@@ -1568,7 +1568,8 @@ static __global__ void kvarn_store_workspace_commit_kernel(
         int tokens_per_stream,
         int stage_groups,
         int tail_groups,
-        bool swa) {
+        bool swa,
+        bool skip_contained) {
     const int head = blockIdx.x;
     const int active_stream = blockIdx.y / (KVAR_N_DIM * stage_groups);
     const int stage_local = blockIdx.y - active_stream * (KVAR_N_DIM * stage_groups);
@@ -1640,7 +1641,22 @@ static __global__ void kvarn_store_workspace_commit_kernel(
         if (max_group < (swa ? 0 : 1)) {
             return;
         }
-        while (max_group >= (swa ? 0 : 1) && (swa ? (max_group % stage_groups) != slot : ((max_group - 1) % tail_groups) != slot)) {
+        // Группа, целиком уложившаяся в этот стор, запечатывается прямо из
+        // рабочего буфера (kvarn_store_workspace_flush_kernel читает workspace
+        // для всего диапазона [start_local, end_local)), поэтому её строки F16
+        // не нужны никому. Раньше мы их всё равно писали - и длинный
+        // непрерывный стор промпта проходил по ВСЕМ слотам стейджа, затирая
+        // живые незавершённые группы других последовательностей в общем кэше.
+        // Пропускаем такие группы: слот трогает только та группа, часть которой
+        // лежит вне стора (начальная, чей префикс уже в стейдже, и хвостовая,
+        // которая останется незавершённой).
+        auto fully_inside = [&](int g) {
+            return skip_contained && !swa &&
+                g * KVAR_N_DIM >= start_local && (g + 1) * KVAR_N_DIM <= end_local;
+        };
+        while (max_group >= (swa ? 0 : 1) &&
+                ((swa ? (max_group % stage_groups) != slot : ((max_group - 1) % tail_groups) != slot) ||
+                 fully_inside(max_group))) {
             --max_group;
         }
         if (max_group < (swa ? 0 : 1)) {
@@ -1685,6 +1701,12 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int stage_groups = kvarn_resolve_stage_groups(dst);
     const int tail_groups = kvarn_resolve_tail_groups(dst, stage_groups);
     const bool eager_records = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
+    // Сквозная запись стейджа на длинном непрерывном сторе: группа, целиком
+    // уложившаяся в стор, запечатывается прямо из рабочего буфера, поэтому её
+    // строки F16 никому не нужны. GGML_KVARN_STAGE_PASSTHROUGH=1 возвращает
+    // прежнее поведение - только для сверки.
+    static const bool stage_passthrough = getenv("GGML_KVARN_STAGE_PASSTHROUGH") != nullptr;
+    const bool stage_skip_contained = eager_records && !stage_passthrough;
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
     GGML_ASSERT(head_slices == 1 || head_slices == 2 || head_slices == 4);
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
@@ -1834,7 +1856,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             tokens_per_stream_hint,
             stage_groups,
             tail_groups,
-            swa);
+            swa,
+            stage_skip_contained);
         kvarn_store_kernel_headwide<<<n_heads / head_slices, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
             (const float *) current->data,
             (const int64_t *) indices->data,
@@ -1969,7 +1992,8 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             tokens_per_stream_hint,
             stage_groups,
             tail_groups,
-            swa);
+            swa,
+            stage_skip_contained);
         kvarn_store_kernel_hishmem<<<n_heads, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
             (const float *) current->data,
             (const int64_t *) indices->data,

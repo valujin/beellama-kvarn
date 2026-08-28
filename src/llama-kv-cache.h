@@ -432,6 +432,8 @@ private:
     std::vector<std::vector<int32_t>> restored_tail_payload_slots;
     uint32_t allocation_group_size = 1;
     uint32_t allocation_stage_groups = 1;
+    // Липкий признак «группа была заполнена целиком, живёт в записях».
+    mutable std::vector<uint8_t> allocation_group_sealed;
     // Structured unified caches reserve whole record groups for one exact
     // sequence-id set. Completed records remain freely shareable capacity;
     // only incomplete groups contend for the small cyclic F16 stage. Keep an

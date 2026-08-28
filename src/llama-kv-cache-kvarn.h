@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -78,6 +79,22 @@ inline uint32_t llama_kvarn_non_swa_tail_groups(uint32_t n_batch, uint32_t n_uba
     // is unchanged between depth 1 and 2 (7.1898 either way, Qwen3.6-27B kvarn6
     // at 4K). On the delayed path from_stage() DOES widen with tail_groups, so
     // anything that turns eager records off must revisit this value.
+    // Диагностический/настроечный переключатель ширины кольца слотов F16.
+    // Слот группы g равен 1 + ((g-1) % tail_groups), поэтому при большом
+    // tail_groups две живые незавершённые группы перестают делить строки.
+    // Цена - 8 МиБ на слот (128 токенов x 8 срезов голов x 128 x F16 x 2
+    // стороны x 16 слоёв полного внимания на Qwen3.8-27B).
+    static const uint32_t override_groups = [] {
+        const char * env = getenv("LLAMA_KVARN_TAIL_GROUPS");
+        if (env == nullptr) {
+            return 0u;
+        }
+        const int v = atoi(env);
+        return v > 0 ? uint32_t(v) : 0u;
+    }();
+    if (override_groups > 0) {
+        return override_groups;
+    }
     return 2;
 }
 

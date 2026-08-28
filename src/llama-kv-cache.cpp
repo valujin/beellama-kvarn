@@ -2369,18 +2369,77 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         if (!cells.is_empty(0)) {
             stage_owners[0] = 0;
         }
-        for (llama_seq_id seq_id = 0; uint32_t(seq_id) < n_seq_max; ++seq_id) {
-            const uint32_t head = heads[size_t(seq_id)];
-            if (head == 0 || head%allocation_group_size == 0) {
+        // Слот F16 держит КАЖДАЯ живая незавершённая группа, а не только та, на
+        // которую смотрит голова какой-нибудь последовательности. Прежний
+        // засев по головам пропускал незавершённые группы уже отработавших
+        // запросов (кэш промпта слота остаётся лежать в кэше и обычно
+        // заканчивается посреди группы), и длинный промпт другого слота
+        // спокойно занимал те же слоты. Отсюда и наблюдаемое падение:
+        // группы 187 и 375 отличаются на 188, что кратно tail_groups=4.
+        //
+        // Запечатанная группа (была заполнена целиком хотя бы раз с момента,
+        // когда последний раз опустела) живёт в записях, а не в F16, поэтому
+        // слот ей больше не нужен. Флаг липкий и сбрасывается только при
+        // опустошении группы.
+        if (allocation_group_sealed.size() != n_groups) {
+            allocation_group_sealed.assign(n_groups, 0);
+        }
+        for (uint32_t group = 1; group < n_groups; ++group) {
+            if (group_used[group] == 0) {
+                allocation_group_sealed[group] = 0;
                 continue;
             }
-            const uint32_t group = (head - 1u)/allocation_group_size;
-            if (group > 0) {
-                const uint32_t slot = stage_slot(group);
-                if (stage_owners[slot] >= 0 && uint32_t(stage_owners[slot]) != group) {
-                    throw std::runtime_error("structured KV live groups alias one F16 stage slot");
+            if (group_used[group] >= allocation_group_size) {
+                allocation_group_sealed[group] = 1;
+                continue;
+            }
+            if (allocation_group_sealed[group]) {
+                continue;
+            }
+            const uint32_t slot = stage_slot(group);
+            if (stage_owners[slot] >= 0 && uint32_t(stage_owners[slot]) != group) {
+                if (getenv("LLAMA_KVARN_DEBUG_STAGE")) {
+                    LLAMA_LOG_ERROR("KVARN-ALIAS: group=%u slot=%u already owned by group=%d | stage_groups=%u\n",
+                            group, slot, stage_owners[slot], allocation_stage_groups);
                 }
-                stage_owners[slot] = int32_t(group);
+                throw std::runtime_error("structured KV live groups alias one F16 stage slot");
+            }
+            stage_owners[slot] = int32_t(group);
+        }
+        const bool dbg_stage = getenv("LLAMA_KVARN_DEBUG_STAGE") != nullptr;
+        std::string dbg_live;
+        if (dbg_stage) {
+            for (uint32_t g = 1; g < n_groups; ++g) {
+                if (group_used[g] == 0 || group_used[g] >= allocation_group_size) {
+                    continue;
+                }
+                char buf[64];
+                snprintf(buf, sizeof(buf), " %u(%u%s)->s%u", g, group_used[g],
+                        allocation_group_sealed[g] ? ",зап" : "", stage_slot(g));
+                dbg_live += buf;
+            }
+        }
+
+        // Полностью уложившаяся в этот стор группа запечатывается прямо из
+        // рабочего буфера и вообще не пишет строки в стейдж (см. правку в
+        // kvarn_store_workspace_commit_kernel), поэтому слот ей не нужен.
+        // Без этой поблажки длинный промпт терял бы каждую T-ю группу.
+        // Условие безопасное и узкое: ubatch односеквенсный, кандидат стоит на
+        // начале группы, и до конца ubatch'а осталось не меньше целой группы -
+        // значит следующие токены той же последовательности её и добьют.
+        bool ubatch_one_seq = true;
+        {
+            llama_seq_id only_seq = -1;
+            for (uint32_t i = 0; i < ubatch.n_tokens && ubatch_one_seq; ++i) {
+                if (ubatch.n_seq_id[i] != 1) {
+                    ubatch_one_seq = false;
+                    break;
+                }
+                if (only_seq < 0) {
+                    only_seq = ubatch.seq_id[i][0];
+                } else if (ubatch.seq_id[i][0] != only_seq) {
+                    ubatch_one_seq = false;
+                }
             }
         }
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -2434,19 +2493,43 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     continue;
                 }
 
-                const uint32_t slot = stage_slot(group);
-                if (group_used[group] == 0 && stage_owners[slot] >= 0 &&
-                        uint32_t(stage_owners[slot]) != group) {
+                // В запечатанную незавершённую группу дописывать нельзя: её
+                // префикс лежит в записи, а сшивающее ядро берёт недостающие
+                // строки из стейджа, где их уже нет.
+                if (group > 0 && group_used[group] > 0 &&
+                        group_used[group] < allocation_group_size &&
+                        allocation_group_sealed[group]) {
                     continue;
                 }
-                if (group_used[group] == 0) {
+
+                const uint32_t slot = stage_slot(group);
+                const bool group_is_new = group_used[group] == 0;
+                const bool fills_here = ubatch_one_seq && group > 0 &&
+                        idx%allocation_group_size == 0 &&
+                        ubatch.n_tokens - i >= allocation_group_size;
+                if (group_is_new && !fills_here && stage_owners[slot] >= 0 &&
+                        uint32_t(stage_owners[slot]) != group) {
+                    if (dbg_stage && idx%allocation_group_size == 0) {
+                        LLAMA_LOG_ERROR("KVARN-SKIP: группа %u слот %u занята группой %d\n",
+                                group, slot, stage_owners[slot]);
+                    }
+                    continue;
+                }
+                if (group_is_new && !fills_here) {
                     stage_owners[slot] = int32_t(group);
                 }
 
                 res.idxs[0].push_back(idx);
                 reserved[idx] = true;
                 if (++group_used[group] == allocation_group_size && group > 0) {
-                    stage_owners[slot] = -1;
+                    allocation_group_sealed[group] = 1;
+                    // Слот отпускается сразу: сшивающее ядро (flush) читает
+                    // старое содержимое стейджа и запускается ДО ядра записи
+                    // (commit), поэтому новый владелец слота не может испортить
+                    // префикс уже запечатанной группы внутри одного графа.
+                    if (stage_owners[slot] == int32_t(group)) {
+                        stage_owners[slot] = -1;
+                    }
                 }
                 for (int32_t j = 0; j < n_cell_seqs; ++j) {
                     heads[size_t(cell_seqs[j])] = head_cur;
@@ -2457,6 +2540,13 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             if (!found) {
                 return {};
             }
+        }
+        if (dbg_stage && !dbg_live.empty()) {
+            LLAMA_LOG_ERROR("KVARN-SEED: токенов=%u одна_посл=%d занято=%u ячейки %u..%u живые={%s }\n",
+                    ubatch.n_tokens, int(ubatch_one_seq), cells.get_used(),
+                    res.idxs[0].empty() ? 0u : res.idxs[0].front(),
+                    res.idxs[0].empty() ? 0u : res.idxs[0].back(),
+                    dbg_live.c_str());
         }
         return res;
     }
@@ -4674,16 +4764,70 @@ void llama_kv_cache::state_v2_read_payload_and_install(
             }
         }
 
+        // Незавершённая группа структурированного кэша живёт ТОЛЬКО в буфере
+        // F16, и её место там — арифметика от номера группы:
+        // slot = 1 + ((group - 1) % allocation_stage_groups). Восстановление
+        // состояния до сих пор искало любую пустую группу-приёмник и про эту
+        // арифметику не знало. Если приёмник попадал на слот, который уже
+        // держит живая незавершённая группа другой последовательности, их
+        // строки F16 накладывались, и следующий find_slot бросал
+        // "structured KV live groups alias one F16 stage slot".
+        //
+        // Именно этот путь и роняет сервер при --kv-unified --parallel 2 с
+        // KVarN и спекуляцией: чекпойнты спекуляции восстанавливают кэш слота
+        // мимо аллокатора, поэтому проверка в find_slot помочь не могла.
+        // Замер: глубина 24000, кольцо из четырёх слотов, группы 187 и 375
+        // (разность 188 кратна четырём) — падение 100%.
+        //
+        // Завершённой группе слот не нужен: она уже лежит в записях.
+        std::unordered_map<uint32_t, uint32_t> source_group_fill;
+        for (const auto & stream : manifest.streams) {
+            for (const auto & saved : stream.cells) {
+                ++source_group_fill[saved.source_cell/state_remap_group_size];
+            }
+        }
+        const bool stage_aware =
+            allocation_group_size > 1 && n_stream == 1 &&
+            state_remap_group_size == allocation_group_size &&
+            allocation_stage_groups > 0;
+        std::vector<int32_t> stage_owner(allocation_stage_groups + 1u, -1);
+        auto remap_stage_slot = [&](uint32_t group) {
+            return group == 0 ? 0u : 1u + ((group - 1u)%allocation_stage_groups);
+        };
+        if (stage_aware) {
+            const uint32_t n_alloc_groups = cells.size()/allocation_group_size;
+            for (uint32_t g = 1; g < n_alloc_groups; ++g) {
+                uint32_t used = 0;
+                const uint32_t begin = g*allocation_group_size;
+                const uint32_t end = std::min<uint32_t>(begin + allocation_group_size, cells.size());
+                for (uint32_t c = begin; c < end; ++c) {
+                    used += !cells.is_empty(c);
+                }
+                if (used == 0 || used >= allocation_group_size) {
+                    continue;
+                }
+                stage_owner[remap_stage_slot(g)] = int32_t(g);
+            }
+            if (!cells.is_empty(0)) {
+                stage_owner[0] = 0;
+            }
+        }
+
         std::unordered_map<uint32_t, uint32_t> destination_groups;
         std::set<uint32_t> reserved_groups;
         const uint32_t n_groups = cells.size()/state_remap_group_size;
         for (const uint32_t source_group : source_groups) {
+            const bool needs_stage = stage_aware &&
+                source_group_fill[source_group] < state_remap_group_size;
             uint32_t destination_group = UINT32_MAX;
             for (uint32_t pass = 0; pass < 2 && destination_group == UINT32_MAX; ++pass) {
                 for (uint32_t candidate = 0; candidate < n_groups; ++candidate) {
                     if ((pass == 0 && candidate != source_group) ||
                             (pass == 1 && candidate == source_group) ||
                             reserved_groups.count(candidate) != 0) {
+                        continue;
+                    }
+                    if (needs_stage && stage_owner[remap_stage_slot(candidate)] >= 0) {
                         continue;
                     }
                     bool empty = true;
@@ -4702,6 +4846,9 @@ void llama_kv_cache::state_v2_read_payload_and_install(
             }
             if (destination_group == UINT32_MAX) {
                 throw std::runtime_error("failed to allocate a complete KV state destination group");
+            }
+            if (needs_stage) {
+                stage_owner[remap_stage_slot(destination_group)] = int32_t(destination_group);
             }
             destination_groups.emplace(source_group, destination_group);
             reserved_groups.insert(destination_group);
@@ -5665,6 +5812,7 @@ void llama_kv_cache::reset_allocation_head(llama_seq_id seq_id) {
     }
     allocation_seq_heads[size_t(seq_id)] = 0;
 }
+
 
 void llama_kv_cache::rebuild_allocation_head(llama_seq_id seq_id) {
     if (seq_id < 0 || uint32_t(seq_id) >= n_seq_max ||
