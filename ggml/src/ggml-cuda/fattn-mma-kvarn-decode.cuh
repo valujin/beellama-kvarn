@@ -260,7 +260,8 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
 
     static_assert(D == 128 || D == 256 || D == 512, "KVarN decode MMA supports 128/256/512-wide heads");
     static_assert(MAX_GQA > 0 && MAX_GQA <= 8, "KVarN decode MMA expects at most eight GQA heads");
-    static_assert(SPLIT_TOKENS == 64, "KVarN decode MMA production splits use 64 KV tokens");
+    static_assert(SPLIT_TOKENS == 64 || SPLIT_TOKENS == 128,
+        "KVarN decode MMA production splits use 64 or 128 KV tokens");
     static_assert(NWARPS % WARPS_PER_CHUNK == 0 && NWARPS >= WARPS_PER_CHUNK &&
         NWARPS <= TOKEN_CHUNKS * WARPS_PER_CHUNK && NWARPS <= 16,
         "KVarN decode MMA needs whole 128-dim slice groups and at most sixteen warps");
@@ -850,6 +851,20 @@ static int ggml_cuda_fattn_kvarn_decode_active_blocks_per_sm() {
     return max_blocks_per_sm;
 }
 
+// Принудительный выбор длины сплита для замеров. Оценка кандидатов взвешивает
+// эффективность волны множителем 10000, а число сплитов — единицей, поэтому
+// геометрия на 64 токена выигрывает у 128 всегда (99% против 95% при равном
+// числе резидентных блоков), и эффект длины сплита нельзя измерить, не обойдя
+// сам выбор. GGML_KVARN_SPLIT_TOKENS=128 оставляет только кандидатов с этой
+// длиной.
+static int ggml_cuda_fattn_kvarn_decode_forced_split() {
+    static const int value = [] {
+        const char * env = getenv("GGML_KVARN_SPLIT_TOKENS");
+        return env != nullptr ? atoi(env) : 0;
+    }();
+    return value;
+}
+
 template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>
 static void ggml_cuda_fattn_kvarn_decode_consider(
         ggml_cuda_fattn_kvarn_decode_geometry & best,
@@ -860,6 +875,10 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
         const int n_q_heads,
         const int n_kv_heads,
         const int n_stream) {
+    const int forced_split = ggml_cuda_fattn_kvarn_decode_forced_split();
+    if (forced_split > 0 && SPLIT_TOKENS != forced_split) {
+        return;
+    }
     const int gqa_ratio = n_q_heads / n_kv_heads;
     const int n_splits = ggml_cuda_fattn_kvarn_decode_div_up_i64(n_kv, SPLIT_TOKENS);
     const int n_gqa_blocks = ggml_cuda_fattn_kvarn_decode_div_up_i64(gqa_ratio, MAX_GQA);
@@ -880,9 +899,48 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
     // Upstream queries actual occupancy, then scores wave efficiency inside one kernel family.
     // KVarN is choosing between different CTA shapes; when split/combine work is equal, the
     // occupancy result is the architectural signal, and wave efficiency is secondary.
+    // Вес эффективности волны зависит от того, сколько волн вообще будет.
+    //
+    // Прежняя постоянная 10000 делала четыре процентных пункта эффективности
+    // дороже, чем двукратное сокращение числа сплитов, и геометрия на 64 токена
+    // выигрывала всегда:
+    //
+    //   n_kv=65024: split=64  волн=25 эффективность=99% оценка=4987984
+    //               split=128 волн=13 эффективность=95% оценка=4948492
+    //
+    // Замер показывает обратное: принудительный сплит 128 даёт 29.70 против
+    // 28.36 tok/s на одном слоте, то есть +4.7% при побитово том же выводе.
+    // Причина в том, что у блока есть постоянная цена — загрузка Q, осей,
+    // последовательный расчёт zq, барьеры подготовки, — и она не зависит от
+    // длины сплита. Вдвое меньше блоков означает вдвое меньше этой цены.
+    //
+    // Потеря на хвосте последней волны стоит своего веса только когда волн
+    // мало: при десятке волн недогруз последней размазан по всем и почти ничего
+    // не стоит. Порог в четыре волны отделяет «параллелизма с запасом» от «его в
+    // обрез».
+    //
+    // Вес подобран по ЗАМЕРЕННЫМ значениям, а не по предполагаемым. Отладка
+    // маршрутов на реальной нагрузке (n_kv=65024, один слот, D=256, k5/v5):
+    //
+    //   сплит  64: сплитов 1016, блоков на SM 4, эффективность 95%, волн 13
+    //   сплит 128: сплитов  508, блоков на SM 4, эффективность 88%, волн  7
+    //
+    // Разрыв по эффективности семь пунктов, поэтому при весе 100 выигрывал
+    // сплит 64 с перевесом 192 — а замер показывает обратное: 32.51 против
+    // 31.00 tok/s в пользу 128. То есть эффективность волны была переоценена
+    // как минимум в этом отношении. При весе 10 сплит 128 побеждает на всех
+    // глубинах от 40 тысяч до 130 тысяч и при одном и при двух слотах, с
+    // перевесом не меньше 312.
+    //
+    // Осторожно: 100 давало верный ответ почти везде и ошибалось лишь в узком
+    // окне около n_kv=65024 при одном слоте. Проверять такие пороги надо
+    // отладкой маршрутов на реальной нагрузке, а не подстановкой в формулу:
+    // именно подстановка предполагаемого числа блоков (8 вместо истинных 4)
+    // и увела оценку.
+    const int64_t wave_weight = n_waves >= 4 ? 10 : 10000;
     const int64_t score =
         (int64_t) max_blocks_per_sm * 1000000 +
-        (int64_t) wave_efficiency_percent * 10000 -
+        (int64_t) wave_efficiency_percent * wave_weight -
         (int64_t) n_gqa_blocks * 1000 -
         (int64_t) n_splits;
 
@@ -929,6 +987,16 @@ ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 8, K_BITS, V_BITS>(
             best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 8, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+        // Сплит на 128 токенов совпадает с группой записи: постоянная цена
+        // блока (загрузка Q, осей, последовательный расчёт zq, барьеры)
+        // раскладывается на вдвое большее число токенов, а число сплитов —
+        // и вместе с ним буфер частичных сумм и работа объединения — вдвое
+        // падает. Разделяемой памяти нужно на ~5 КиБ больше, четыре блока на
+        // мультипроцессор при этом сохраняются.
+        ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+        ggml_cuda_fattn_kvarn_decode_consider<D, 8, 128, 8, K_BITS, V_BITS>(
             best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
     } else if constexpr (D == 128) {
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 4, K_BITS, V_BITS>(
@@ -987,6 +1055,10 @@ static void ggml_cuda_fattn_kvarn_decode_launch_gqa(
     } else if constexpr (D == 256) {
         if (args.split_tokens == 64 && args.nwarps == 8) {
             ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 64, 8, K_BITS, V_BITS>(args, blocks_split);
+            return;
+        }
+        if (args.split_tokens == 128 && args.nwarps == 8) {
+            ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 128, 8, K_BITS, V_BITS>(args, blocks_split);
             return;
         }
     } else if constexpr (D == 128) {
