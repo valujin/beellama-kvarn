@@ -829,11 +829,12 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
             "CUDA_FA_ROUTE_EXEC_DISPATCH kernel=KVARN_DECODE_SPLIT "
             "Q=[%lld,%lld,%lld,%lld] bits=[%d,%d] n_kv=%d n_kv_heads=%d n_stream=%d "
             "gqa=%d gqa_blocks=%d max_gqa=%d n_splits=%d split_tokens=%d nwarps=%d "
-            "active_blocks_per_sm=%d wave_efficiency=%d waves=%d\n",
+            "active_blocks_per_sm=%d wave_efficiency=%d waves=%d q_tile=%d\n",
             (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
             plan.k.bits, plan.v.bits, plan.n_kv, plan.n_kv_heads, plan.n_stream,
             gqa_ratio, n_gqa_blocks, gqa_per_block, n_splits, split_tokens, geometry.nwarps,
-            geometry.max_blocks_per_sm, geometry.wave_efficiency_percent, geometry.n_waves);
+            geometry.max_blocks_per_sm, geometry.wave_efficiency_percent, geometry.n_waves,
+            geometry.q_tile > 0 ? geometry.q_tile : 1);
         fflush(stderr);
     }
 
@@ -866,6 +867,7 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     args.n_splits = n_splits;
     args.split_tokens = split_tokens;
     args.nwarps = geometry.nwarps;
+    args.q_tile = geometry.q_tile > 0 ? geometry.q_tile : 1;
     args.wave_size = ggml_cuda_info().devices[ctx.device].warp_size;
     args.stream = stream;
 

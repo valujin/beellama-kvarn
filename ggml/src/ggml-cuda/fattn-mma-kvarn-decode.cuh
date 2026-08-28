@@ -202,7 +202,13 @@ static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_decode_unpack2(
     b = (int) ((packed >> (shift + BITS)) & mask);
 }
 
-template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>
+// Q_TILE — сколько строк запроса обслуживает один блок. Раньше их всегда была
+// одна, и при n_q > 1 несколько блоков независимо распаковывали одни и те же
+// записи кэша. Внутри блока распакованный фрагмент лежит в регистрах, и
+// выполнить по нему Q_TILE матричных инструкций с разными строками запроса
+// стоит только лишнего аккумулятора. Порядок суммирования внутри каждой
+// строки не меняется, поэтому результат побитово тот же.
+template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS, int Q_TILE = 1>
 // Потолок нитей на мультипроцессор у sm_86 равен 1536, поэтому требовать четыре
 // блока можно только пока NWARPS*32*4 в него укладывается. При NWARPS=16 это 2048,
 // и ptxas молча игнорирует указание целиком — берём максимум допустимого.
@@ -233,9 +239,11 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         int n_gqa_blocks,
         int n_splits) {
     const int split = blockIdx.x;
-    const int q_index = blockIdx.y % n_q;
-    const int gqa_block = (blockIdx.y / n_q) % n_gqa_blocks;
-    const int kv_head = blockIdx.y / (n_q * n_gqa_blocks);
+    const int n_q_tiles = (n_q + Q_TILE - 1) / Q_TILE;
+    const int q_base = (blockIdx.y % n_q_tiles) * Q_TILE;
+    const int q_count = min(Q_TILE, n_q - q_base);
+    const int gqa_block = (blockIdx.y / n_q_tiles) % n_gqa_blocks;
+    const int kv_head = blockIdx.y / (n_q_tiles * n_gqa_blocks);
     const int stream = blockIdx.z;
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
@@ -262,6 +270,8 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     static_assert(MAX_GQA > 0 && MAX_GQA <= 8, "KVarN decode MMA expects at most eight GQA heads");
     static_assert(SPLIT_TOKENS == 64 || SPLIT_TOKENS == 128,
         "KVarN decode MMA production splits use 64 or 128 KV tokens");
+    static_assert(Q_TILE >= 1 && Q_TILE <= 4,
+        "KVarN decode MMA serves between one and four query rows per block");
     static_assert(NWARPS % WARPS_PER_CHUNK == 0 && NWARPS >= WARPS_PER_CHUNK &&
         NWARPS <= TOKEN_CHUNKS * WARPS_PER_CHUNK && NWARPS <= 16,
         "KVarN decode MMA needs whole 128-dim slice groups and at most sixteen warps");
@@ -272,10 +282,14 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     static_assert(PHYSICAL_WAVE_SIZE == 32 || PHYSICAL_WAVE_SIZE == 64,
         "KVarN decode MMA requires a physical wave size of 32 or 64");
 
-    __shared__ __align__(16) half2 q_sh[Q_ROWS][Q_STRIDE2];
+    __shared__ __align__(16) half2 q_sh[Q_TILE][Q_ROWS][Q_STRIDE2];
+    // score_partial_sh намеренно БЕЗ измерения Q_TILE: свёртка по варпам идёт по
+    // строкам запроса по очереди, а сами частичные суммы к этому моменту лежат в
+    // регистрах. Так правка стоит на 4 КиБ разделяемой памяти меньше, и четыре
+    // блока на мультипроцессор сохраняются.
     __shared__ __align__(16) float score_partial_sh[NWARPS][MAX_GQA * TOKENS_PER_CHUNK];
-    __shared__ __align__(16) float score_sh[MAX_GQA][SPLIT_TOKENS];
-    __shared__ __align__(16) half2 p_sh[MAX_GQA][P_STRIDE2];
+    __shared__ __align__(16) float score_sh[Q_TILE][MAX_GQA][SPLIT_TOKENS];
+    __shared__ __align__(16) half2 p_sh[Q_TILE][MAX_GQA][P_STRIDE2];
     // Оси квантования лежат в записи как half и раньше раскладывались в shared
     // как float. Точности это не добавляло ни одного бита — значение уже прошло
     // округление до half при записи, — зато стоило вдвое больше байт shared и
@@ -290,9 +304,9 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
 #define KVARN_AXIS_SCALE(sl, i) __half2float(axes_sh[sl][(i)])
 #define KVARN_AXIS_ZP(sl, i)    __half2float(axes_sh[sl][GGML_CUDA_FATTN_KVARN_DIM + (i)])
 #define KVARN_AXIS_OTHER(sl, i) __half2float(axes_sh[sl][2 * GGML_CUDA_FATTN_KVARN_DIM + (i)])
-    __shared__ float zq_sh[SLICES][MAX_GQA];
-    __shared__ float m_sh[MAX_GQA];
-    __shared__ float denom_sh[MAX_GQA];
+    __shared__ float zq_sh[Q_TILE][SLICES][MAX_GQA];
+    __shared__ float m_sh[Q_TILE][MAX_GQA];
+    __shared__ float denom_sh[Q_TILE][MAX_GQA];
 
     const ggml_cuda_fattn_kvarn_desc & k_desc = k_descs[stream * n_kv_heads + kv_head];
     const ggml_cuda_fattn_kvarn_desc & v_desc = v_descs[stream * n_kv_heads + kv_head];
@@ -319,19 +333,26 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     // Скипаем только полный сплит: у последнего, неполного, позиции за token_end
     // несут -FLT_MAX/2 без маски, и знаменатель у него бывает ненулевым.
     if (mask != nullptr && token_end - token_begin == SPLIT_TOKENS) {
-        const char * mask_base = mask + nb33 * (stream % ne33) + nb31 * q_index;
+        // Сплит можно пропустить только если он полностью замаскирован для ВСЕХ
+        // строк запроса, которые ведёт этот блок: они делят распакованные записи,
+        // но не маску.
         int live = 0;
-        for (int token = token_begin + tid; token < token_end;
-                token += NWARPS * PHYSICAL_WAVE_SIZE) {
-            const half mv = *(const half *) (mask_base + nb30 * token);
-            live |= !__hisinf(mv);
+        for (int qt = 0; qt < q_count; ++qt) {
+            const char * mask_base = mask + nb33 * (stream % ne33) + nb31 * (q_base + qt);
+            for (int token = token_begin + tid; token < token_end;
+                    token += NWARPS * PHYSICAL_WAVE_SIZE) {
+                const half mv = *(const half *) (mask_base + nb30 * token);
+                live |= !__hisinf(mv);
+            }
         }
         if (__syncthreads_or(live) == 0) {
             if (tid < gqa_head_count && q_head0 + tid < n_q_heads) {
-                const size_t base =
-                    (((size_t) stream * n_q + q_index) * n_q_heads + (q_head0 + tid)) *
-                    (size_t) n_splits + split;
-                partial_meta[base] = make_float2(-FLT_MAX / 2.0f, 0.0f);
+                for (int qt = 0; qt < q_count; ++qt) {
+                    const size_t base =
+                        (((size_t) stream * n_q + (q_base + qt)) * n_q_heads + (q_head0 + tid)) *
+                        (size_t) n_splits + split;
+                    partial_meta[base] = make_float2(-FLT_MAX / 2.0f, 0.0f);
+                }
             }
             return;
         }
@@ -364,16 +385,19 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
             ((int64_t) record_group_v * v_desc.n_record_heads + v_desc.head_base + slice) * v_desc.record_bytes;
     }
 
-    half * q_h = (half *) q_sh;
-    for (int i = tid; i < Q_ROWS * D; i += NWARPS * PHYSICAL_WAVE_SIZE) {
-        const int h = i / D;
-        const int dim = i % D;
-        float value = 0.0f;
-        if (h < gqa_head_count && q_head0 + h < n_q_heads) {
-            const float * q = (const float *) (Q + nb03 * stream + nb02 * (q_head0 + h) + nb01 * q_index);
-            value = q[dim] * scale;
+    for (int qt = 0; qt < Q_TILE; ++qt) {
+        half * q_h = (half *) q_sh[qt];
+        for (int i = tid; i < Q_ROWS * D; i += NWARPS * PHYSICAL_WAVE_SIZE) {
+            const int h = i / D;
+            const int dim = i % D;
+            float value = 0.0f;
+            if (qt < q_count && h < gqa_head_count && q_head0 + h < n_q_heads) {
+                const float * q = (const float *)
+                    (Q + nb03 * stream + nb02 * (q_head0 + h) + nb01 * (q_base + qt));
+                value = q[dim] * scale;
+            }
+            q_h[h * (2 * Q_STRIDE2) + dim] = __float2half(value);
         }
-        q_h[h * (2 * Q_STRIDE2) + dim] = __float2half(value);
     }
 
     if (k_split_in_group) {
@@ -392,20 +416,22 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         // tok/s, то есть ровно ничего, при том что меняло порядок суммирования zq
         // и, значит, численный результат. Оставляем последовательную форму: она
         // побитово совпадает с эталоном и не требует отдельной проверки точности.
-        const int n_targets = SLICES * gqa_head_count;
+        const int n_targets = Q_TILE * SLICES * gqa_head_count;
         for (int target = tid; target < n_targets; target += NWARPS * PHYSICAL_WAVE_SIZE) {
-            const int slice = target / gqa_head_count;
-            const int h = target % gqa_head_count;
-            const half * q_row = (const half *) q_sh + h * (2 * Q_STRIDE2) + slice * GGML_CUDA_FATTN_KVARN_DIM;
+            const int qt = target / (SLICES * gqa_head_count);
+            const int rest = target % (SLICES * gqa_head_count);
+            const int slice = rest / gqa_head_count;
+            const int h = rest % gqa_head_count;
+            const half * q_row = (const half *) q_sh[qt] + h * (2 * Q_STRIDE2) + slice * GGML_CUDA_FATTN_KVARN_DIM;
             float zq = 0.0f;
             for (int dim = 0; dim < GGML_CUDA_FATTN_KVARN_DIM; ++dim) {
                 const float q_val = __half2float(q_row[dim]);
                 zq += KVARN_AXIS_ZP(slice, dim) * q_val;
                 const float q_prime = KVARN_AXIS_SCALE(slice, dim) * q_val;
-                ((half *) q_sh)[h * (2 * Q_STRIDE2) + slice * GGML_CUDA_FATTN_KVARN_DIM + dim] =
+                ((half *) q_sh[qt])[h * (2 * Q_STRIDE2) + slice * GGML_CUDA_FATTN_KVARN_DIM + dim] =
                     __float2half(q_prime);
             }
-            zq_sh[slice][h] = zq;
+            zq_sh[qt][slice][h] = zq;
         }
     }
 
@@ -420,10 +446,13 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         const int chunk = chunk_base + local_chunk;
         const bool chunk_active = chunk < TOKEN_CHUNKS;
         const int token0 = token_begin + chunk * TOKENS_PER_CHUNK;
-        T_C scores;
+        T_C scores[Q_TILE];
 #pragma unroll
-        for (int l = 0; l < T_C::ne; ++l) {
-            scores.x[l] = 0.0f;
+        for (int qt = 0; qt < Q_TILE; ++qt) {
+#pragma unroll
+            for (int l = 0; l < T_C::ne; ++l) {
+                scores[qt].x[l] = 0.0f;
+            }
         }
 
         if (chunk_active) {
@@ -440,7 +469,6 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                     dim0 < (warp_in_chunk + 1) * GGML_CUDA_FATTN_KVARN_DIM;
                     dim0 += 2 * T_A::J) {
                 T_A k_a;
-                T_B q_b;
                 // Строки фрагмента идут парами: l и l+1 отличаются только
                 // строкой (get_j совпадает), а после перестановки KVARN_FRAG_ROW
                 // это соседние токены одной строки записи — одна загрузка на пару.
@@ -474,116 +502,141 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                     k_a.x[lp + 0] = make_half2(x00, x10);
                     k_a.x[lp + 1] = make_half2(x01, x11);
                 }
-                load_ldmatrix(q_b, q_sh[0] + dim0 / 2, Q_STRIDE2);
-                mma(scores, k_a, q_b);
-            }
-
+                // Распакованный фрагмент K лежит в регистрах. Прогоняем по нему
+                // все строки запроса тайла: лишняя строка стоит одной загрузки
+                // ldmatrix и одной инструкции mma, а не повторной распаковки.
 #pragma unroll
-            for (int l = 0; l < T_C::ne; ++l) {
-                const int j = KVARN_FRAG_ROW(T_C::get_i(l));
-                const int h = T_C::get_j(l);
-                if (h < MAX_GQA) {
-                    float v = scores.x[l];
-                    if (k_split_in_group && h < gqa_head_count) {
-                        const int pos = k_tile.pos_begin + chunk * TOKENS_PER_CHUNK + j;
-                        v = KVARN_AXIS_OTHER(warp_in_chunk, pos) * (v + zq_sh[warp_in_chunk][h]);
+                for (int qt = 0; qt < Q_TILE; ++qt) {
+                    // q_count одинаков для всего блока, поэтому ветвление не
+                    // расходится по варпу. При нечётном n_q последний тайл ведёт
+                    // одну строку, и вторая пара ldmatrix+mma здесь лишняя.
+                    if (qt >= q_count) {
+                        break;
                     }
-                    score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] = v;
+                    T_B q_b;
+                    load_ldmatrix(q_b, q_sh[qt][0] + dim0 / 2, Q_STRIDE2);
+                    mma(scores[qt], k_a, q_b);
                 }
             }
         }
-        __syncthreads();
 
+        // Свёртка по варпам и запись в score_sh идут по строкам запроса по
+        // очереди: score_partial_sh на все строки один, что и экономит
+        // разделяемую память.
 #pragma unroll
-        for (int stride = WARPS_PER_CHUNK / 2; stride > 0; stride >>= 1) {
-            if (chunk_active && warp_in_chunk < stride) {
+        for (int qt = 0; qt < Q_TILE; ++qt) {
+            if (chunk_active) {
 #pragma unroll
                 for (int l = 0; l < T_C::ne; ++l) {
                     const int j = KVARN_FRAG_ROW(T_C::get_i(l));
                     const int h = T_C::get_j(l);
                     if (h < MAX_GQA) {
-                        score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] +=
-                            score_partial_sh[warp + stride][h * TOKENS_PER_CHUNK + j];
+                        float v = scores[qt].x[l];
+                        if (k_split_in_group && h < gqa_head_count) {
+                            const int pos = k_tile.pos_begin + chunk * TOKENS_PER_CHUNK + j;
+                            v = KVARN_AXIS_OTHER(warp_in_chunk, pos) * (v + zq_sh[qt][warp_in_chunk][h]);
+                        }
+                        score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] = v;
+                    }
+                }
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (int stride = WARPS_PER_CHUNK / 2; stride > 0; stride >>= 1) {
+                if (chunk_active && warp_in_chunk < stride) {
+#pragma unroll
+                    for (int l = 0; l < T_C::ne; ++l) {
+                        const int j = KVARN_FRAG_ROW(T_C::get_i(l));
+                        const int h = T_C::get_j(l);
+                        if (h < MAX_GQA) {
+                            score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] +=
+                                score_partial_sh[warp + stride][h * TOKENS_PER_CHUNK + j];
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (chunk_active && warp_in_chunk == 0) {
+#pragma unroll
+                for (int l = 0; l < T_C::ne; ++l) {
+                    const int j = KVARN_FRAG_ROW(T_C::get_i(l));
+                    const int h = T_C::get_j(l);
+                    const int token = token0 + j;
+                    float score = -FLT_MAX / 2.0f;
+                    if (qt < q_count && h < gqa_head_count && q_head0 + h < n_q_heads && token < token_end) {
+                        score = score_partial_sh[warp][h * TOKENS_PER_CHUNK + j];
+                        if (logit_softcap != 0.0f) {
+                            score = logit_softcap * tanhf(score);
+                        }
+                        if (mask_h != nullptr) {
+                            score += __half2float(*(const half *) ((const char *) mask_h +
+                                nb30 * token + nb31 * (q_base + qt)));
+                        }
+                    }
+                    if (h < MAX_GQA) {
+                        score_sh[qt][h][chunk * TOKENS_PER_CHUNK + j] = score;
                     }
                 }
             }
             __syncthreads();
         }
+    }
 
-        if (chunk_active && warp_in_chunk == 0) {
 #pragma unroll
-            for (int l = 0; l < T_C::ne; ++l) {
-                const int j = KVARN_FRAG_ROW(T_C::get_i(l));
-                const int h = T_C::get_j(l);
-                const int token = token0 + j;
-                float score = -FLT_MAX / 2.0f;
-                if (h < gqa_head_count && q_head0 + h < n_q_heads && token < token_end) {
-                    score = score_partial_sh[warp][h * TOKENS_PER_CHUNK + j];
-                    if (logit_softcap != 0.0f) {
-                        score = logit_softcap * tanhf(score);
-                    }
-                    if (mask_h != nullptr) {
-                        score += __half2float(*(const half *) ((const char *) mask_h + nb30 * token + nb31 * q_index));
-                    }
-                }
-                if (h < MAX_GQA) {
-                    score_sh[h][chunk * TOKENS_PER_CHUNK + j] = score;
-                }
+    for (int qt = 0; qt < Q_TILE; ++qt) {
+        half * p_h = (half *) p_sh[qt];
+#if defined(GGML_USE_HIP) && defined(CDNA)
+        if (tid < MAX_GQA) {
+            const int h = tid;
+            float m = -FLT_MAX / 2.0f;
+            for (int token = 0; token < SPLIT_TOKENS; ++token) {
+                m = fmaxf(m, score_sh[qt][h][token] + FATTN_KQ_MAX_OFFSET);
+            }
+            float denom = 0.0f;
+            for (int token = 0; token < SPLIT_TOKENS; ++token) {
+                const float diff = score_sh[qt][h][token] - m;
+                const float weight = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
+                denom += weight;
+                p_h[h * (2 * P_STRIDE2) + token] = __float2half(weight);
+            }
+            m_sh[qt][h] = m;
+            denom_sh[qt][h] = denom;
+        }
+#else
+        const int h = tid / 16;
+        const int lane_h = tid % 16;
+        float m = -FLT_MAX / 2.0f;
+        if (h < MAX_GQA) {
+            for (int token = lane_h; token < SPLIT_TOKENS; token += 16) {
+                m = fmaxf(m, score_sh[qt][h][token] + FATTN_KQ_MAX_OFFSET);
             }
         }
-        __syncthreads();
-    }
-
-    half * p_h = (half *) p_sh;
-#if defined(GGML_USE_HIP) && defined(CDNA)
-    if (tid < MAX_GQA) {
-        const int h = tid;
-        float m = -FLT_MAX / 2.0f;
-        for (int token = 0; token < SPLIT_TOKENS; ++token) {
-            m = fmaxf(m, score_sh[h][token] + FATTN_KQ_MAX_OFFSET);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, offset, 16));
         }
+
         float denom = 0.0f;
-        for (int token = 0; token < SPLIT_TOKENS; ++token) {
-            const float diff = score_sh[h][token] - m;
-            const float weight = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
-            denom += weight;
-            p_h[h * (2 * P_STRIDE2) + token] = __float2half(weight);
+        if (h < MAX_GQA) {
+            for (int token = lane_h; token < SPLIT_TOKENS; token += 16) {
+                const float diff = score_sh[qt][h][token] - m;
+                const float weight = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
+                denom += weight;
+                p_h[h * (2 * P_STRIDE2) + token] = __float2half(weight);
+            }
         }
-        m_sh[h] = m;
-        denom_sh[h] = denom;
-    }
-#else
-    const int h = tid / 16;
-    const int lane_h = tid % 16;
-    float m = -FLT_MAX / 2.0f;
-    if (h < MAX_GQA) {
-        for (int token = lane_h; token < SPLIT_TOKENS; token += 16) {
-            m = fmaxf(m, score_sh[h][token] + FATTN_KQ_MAX_OFFSET);
-        }
-    }
 #pragma unroll
-    for (int offset = 8; offset > 0; offset >>= 1) {
-        m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, offset, 16));
-    }
-
-    float denom = 0.0f;
-    if (h < MAX_GQA) {
-        for (int token = lane_h; token < SPLIT_TOKENS; token += 16) {
-            const float diff = score_sh[h][token] - m;
-            const float weight = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
-            denom += weight;
-            p_h[h * (2 * P_STRIDE2) + token] = __float2half(weight);
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            denom += __shfl_xor_sync(0xFFFFFFFFu, denom, offset, 16);
         }
-    }
-#pragma unroll
-    for (int offset = 8; offset > 0; offset >>= 1) {
-        denom += __shfl_xor_sync(0xFFFFFFFFu, denom, offset, 16);
-    }
-    if (h < MAX_GQA && lane_h == 0) {
-        m_sh[h] = m;
-        denom_sh[h] = denom;
-    }
+        if (h < MAX_GQA && lane_h == 0) {
+            m_sh[qt][h] = m;
+            denom_sh[qt][h] = denom;
+        }
 #endif
+    }
     __syncthreads();
 
     if (v_from_record) {
@@ -618,17 +671,19 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     for (int dim0 = warp * TOKENS_PER_CHUNK; dim0 < D; dim0 += NWARPS * TOKENS_PER_CHUNK) {
         const int slice = dim0 / GGML_CUDA_FATTN_KVARN_DIM;
         const int local_dim0 = dim0 % GGML_CUDA_FATTN_KVARN_DIM;
-        T_C out;
+        T_C out[Q_TILE];
 #pragma unroll
-        for (int l = 0; l < T_C::ne; ++l) {
-            out.x[l] = 0.0f;
+        for (int qt = 0; qt < Q_TILE; ++qt) {
+#pragma unroll
+            for (int l = 0; l < T_C::ne; ++l) {
+                out[qt].x[l] = 0.0f;
+            }
         }
 
 #pragma unroll 1
         for (int chunk = 0; chunk < TOKEN_CHUNKS; ++chunk) {
             const int token0 = token_begin + chunk * TOKENS_PER_CHUNK;
             T_A v_a;
-            T_B p_b;
             // Здесь строка фрагмента — это измерение, а не токен, но приём тот же:
             // после перестановки lp и lp+1 берут соседние измерения одной строки
             // записи V (строка = токен), то есть снова одна загрузка на пару.
@@ -671,18 +726,34 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                 v_a.x[lp + 0] = make_half2(x00, x10);
                 v_a.x[lp + 1] = make_half2(x01, x11);
             }
-            load_ldmatrix(p_b, p_sh[0] + chunk * (TOKENS_PER_CHUNK / 2), P_STRIDE2);
-            mma(out, v_a, p_b);
+            // Распакованный фрагмент V — тоже в регистрах, и по нему так же
+            // проходят все строки запроса тайла.
+#pragma unroll
+            for (int qt = 0; qt < Q_TILE; ++qt) {
+                if (qt >= q_count) {
+                    break;
+                }
+                T_B p_b;
+                load_ldmatrix(p_b, p_sh[qt][0] + chunk * (TOKENS_PER_CHUNK / 2), P_STRIDE2);
+                mma(out[qt], v_a, p_b);
+            }
         }
 
 #pragma unroll
-        for (int l = 0; l < T_C::ne; ++l) {
-            const int dim = dim0 + KVARN_FRAG_ROW(T_C::get_i(l));
-            const int head = T_C::get_j(l);
-            const int q_head = q_head0 + head;
-            if (head < gqa_head_count && q_head < n_q_heads) {
-                const size_t base = (((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split;
-                partial[base * D + dim] = out.x[l];
+        for (int qt = 0; qt < Q_TILE; ++qt) {
+            if (qt >= q_count) {
+                continue;
+            }
+#pragma unroll
+            for (int l = 0; l < T_C::ne; ++l) {
+                const int dim = dim0 + KVARN_FRAG_ROW(T_C::get_i(l));
+                const int head = T_C::get_j(l);
+                const int q_head = q_head0 + head;
+                if (head < gqa_head_count && q_head < n_q_heads) {
+                    const size_t base =
+                        (((size_t) stream * n_q + (q_base + qt)) * n_q_heads + q_head) * n_splits + split;
+                    partial[base * D + dim] = out[qt].x[l];
+                }
             }
         }
         __syncwarp();
@@ -691,8 +762,15 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
 
     if (tid < gqa_head_count && q_head0 + tid < n_q_heads) {
         const int q_head = q_head0 + tid;
-        const size_t base = (((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split;
-        partial_meta[base] = make_float2(m_sh[tid], denom_sh[tid]);
+#pragma unroll
+        for (int qt = 0; qt < Q_TILE; ++qt) {
+            if (qt >= q_count) {
+                continue;
+            }
+            const size_t base =
+                (((size_t) stream * n_q + (q_base + qt)) * n_q_heads + q_head) * n_splits + split;
+            partial_meta[base] = make_float2(m_sh[qt][tid], denom_sh[qt][tid]);
+        }
     }
 }
 
@@ -828,7 +906,7 @@ static inline int ggml_cuda_fattn_kvarn_decode_wave_efficiency_percent(
     return (int) (100 * blocks_total / ((int64_t) *n_waves * blocks_per_wave));
 }
 
-template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>
+template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS, int Q_TILE = 1>
 static int ggml_cuda_fattn_kvarn_decode_active_blocks_per_sm() {
     // Occupancy depends only on the compiled kernel and the device arch, not the workload,
     // so cache it per device: the selector queries several candidates on every decode op.
@@ -842,7 +920,7 @@ static int ggml_cuda_fattn_kvarn_decode_active_blocks_per_sm() {
     int max_blocks_per_sm = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm,
-        ggml_cuda_fattn_kvarn_decode_mma_kernel<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS>,
+        ggml_cuda_fattn_kvarn_decode_mma_kernel<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS, Q_TILE>,
         block_dim.x * block_dim.y * block_dim.z,
         0));
     if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
@@ -857,6 +935,16 @@ static int ggml_cuda_fattn_kvarn_decode_active_blocks_per_sm() {
 // числе резидентных блоков), и эффект длины сплита нельзя измерить, не обойдя
 // сам выбор. GGML_KVARN_SPLIT_TOKENS=128 оставляет только кандидатов с этой
 // длиной.
+// Принудительная ширина тайла строк запроса для замеров: 1 отключает широкий
+// тайл целиком, 2 оставляет только его. Ноль — обычный выбор по оценке.
+static int ggml_cuda_fattn_kvarn_decode_forced_q_tile() {
+    static const int value = [] {
+        const char * env = getenv("GGML_KVARN_Q_TILE");
+        return env != nullptr ? atoi(env) : 0;
+    }();
+    return value;
+}
+
 static int ggml_cuda_fattn_kvarn_decode_forced_split() {
     static const int value = [] {
         const char * env = getenv("GGML_KVARN_SPLIT_TOKENS");
@@ -865,7 +953,7 @@ static int ggml_cuda_fattn_kvarn_decode_forced_split() {
     return value;
 }
 
-template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>
+template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS, int Q_TILE = 1>
 static void ggml_cuda_fattn_kvarn_decode_consider(
         ggml_cuda_fattn_kvarn_decode_geometry & best,
         int64_t & best_score,
@@ -883,15 +971,25 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
     const int n_splits = ggml_cuda_fattn_kvarn_decode_div_up_i64(n_kv, SPLIT_TOKENS);
     const int n_gqa_blocks = ggml_cuda_fattn_kvarn_decode_div_up_i64(gqa_ratio, MAX_GQA);
     const int max_blocks_per_sm =
-        ggml_cuda_fattn_kvarn_decode_active_blocks_per_sm<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS>();
+        ggml_cuda_fattn_kvarn_decode_active_blocks_per_sm<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS, Q_TILE>();
     if (max_blocks_per_sm <= 0 || n_splits <= 0 || n_gqa_blocks <= 0) {
+        return;
+    }
+    // Тайл шире одной строки запроса имеет смысл только когда строк несколько:
+    // при n_q == 1 он ничего не экономит, а разделяемой памяти просит больше.
+    if (Q_TILE > 1 && n_q < Q_TILE) {
+        return;
+    }
+    const int forced_q_tile = ggml_cuda_fattn_kvarn_decode_forced_q_tile();
+    if (forced_q_tile > 0 && Q_TILE != forced_q_tile) {
         return;
     }
     ++best.candidate_count;
 
+    const int n_q_tiles = ggml_cuda_fattn_kvarn_decode_div_up_i64(n_q, Q_TILE);
     const int blocks_per_wave = nsm * max_blocks_per_sm;
     const int64_t blocks_total =
-        (int64_t) n_splits * n_kv_heads * n_gqa_blocks * n_q * n_stream;
+        (int64_t) n_splits * n_kv_heads * n_gqa_blocks * n_q_tiles * n_stream;
     int n_waves = 0;
     const int wave_efficiency_percent =
         ggml_cuda_fattn_kvarn_decode_wave_efficiency_percent(blocks_total, blocks_per_wave, &n_waves);
@@ -937,12 +1035,46 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
     // отладкой маршрутов на реальной нагрузке, а не подстановкой в формулу:
     // именно подстановка предполагаемого числа блоков (8 вместо истинных 4)
     // и увела оценку.
-    const int64_t wave_weight = n_waves >= 4 ? 10 : 10000;
+    // ОЦЕНКА КАНДИДАТА. Прежняя ставила первым слагаемым число резидентных
+    // блоков с весом миллион, а эффективность волны и число сплитов — мелкими
+    // поправками. Это оказалось неверной моделью, и вот на каких замерах она
+    // сломалась (глубина 60000, D=256, kvarn5, MTP n_max 2):
+    //
+    //   тайл 1, сплит 128: блоков на SM 4, волн 18 -> 46.90 tok/s
+    //   тайл 2, сплит 128: блоков на SM 4, волн 12 -> 49.84
+    //   тайл 3, сплит 128: блоков на SM 3, волн  8 -> 53.42
+    //
+    // Тайл на три строки ЛУЧШИЙ, хотя резидентных блоков у него меньше. Прежняя
+    // оценка отвергла бы его: штраф за блок (миллион) перевешивал любую премию.
+    //
+    // Верная величина — число волн. Оно уже содержит в себе и занятость, и
+    // число блоков: waves = blocks_total / (nsm * blocks_per_sm), а blocks_total
+    // падает вместе с шириной тайла. Время ядра пропорционально волнам, и это
+    // подтверждается: 18 / 12 / 8 волн против 46.90 / 49.84 / 53.42 tok/s при
+    // доле внимания около четверти шага.
+    //
+    // Одних волн, однако, мало. Буфер частичных сумм имеет размер
+    // n_splits * n_q * n_q_heads * D, то есть пропорционален числу сплитов, и
+    // его запись плюс чтение объединяющим ядром — настоящий трафик памяти.
+    // Замер при РАВНЫХ волнах (12 против 12, n_q = 2): сплит 128 даёт 46.14,
+    // сплит 64 при том же числе волн — 27.58. Разница целиком в этом буфере.
+    // Поэтому число сплитов входит отдельным штрафом.
+    //
+    // Вес штрафа выбран осторожно: 4000 за сплит означает, что удвоение числа
+    // сплитов при n_kv=60000 стоит примерно двух волн. Замер говорит, что стоит
+    // больше, но направление важнее величины, а заниженный вес безопаснее.
+    //
+    // Проверка формулы на всех имеющихся замерах:
+    //   n_q=1: сплит 64 (волн 13, сплитов 1016) против 128 (волн 7, сплитов 508)
+    //          -> 128 выигрывает; замер: 32.51 против 31.00 в пользу 128. Верно.
+    //   n_q=2: тайл1/128 (волн 12, сплитов 470) против тайл2/64 (волн 12, 938)
+    //          -> 128 выигрывает; замер: 46.14 против 27.58. Верно.
+    //   n_q=3: тайл3 (волн 8) > тайл2 (волн 12) > тайл1 (волн 18). Верно.
     const int64_t score =
-        (int64_t) max_blocks_per_sm * 1000000 +
-        (int64_t) wave_efficiency_percent * wave_weight -
-        (int64_t) n_gqa_blocks * 1000 -
-        (int64_t) n_splits;
+        - (int64_t) n_waves * 1000000
+        - (int64_t) n_splits * 4000
+        + (int64_t) wave_efficiency_percent * 100
+        - (int64_t) n_gqa_blocks * 10;
 
     if (score > best_score) {
         best_score = score;
@@ -955,6 +1087,7 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
         best.max_blocks_per_sm = max_blocks_per_sm;
         best.wave_efficiency_percent = wave_efficiency_percent;
         best.n_waves = n_waves;
+        best.q_tile = Q_TILE;
     }
 }
 
@@ -998,6 +1131,34 @@ ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
             best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 128, 8, K_BITS, V_BITS>(
             best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+        // Тайл на две строки запроса — ТОЛЬКО со сплитом 128, и вот почему.
+        //
+        // Буфер частичных сумм имеет размер n_splits * n_q * n_q_heads * D: он
+        // пропорционален числу сплитов. Сплит 64 удваивает число сплитов, а
+        // значит и запись этого буфера, и его чтение объединяющим ядром. При
+        // n_kv=60000, n_q=2, 24 головах и D=256 это 46 МБ против 23 на каждый
+        // вызов внимания.
+        //
+        // ЗАМЕРЕНО. Первая версия правки сажала тайл на сплит 64, потому что там
+        // хватало разделяемой памяти. При РАВНОМ числе блоков и равном числе
+        // волн (12 против 12, n_q=2, глубина 60000) она дала 27.58 против 46.14
+        // tok/s: лишний трафик буфера съел всю экономию на распаковке и добавил
+        // сверху. Экономия на распаковке реальна, но она вдвое меньше того, что
+        // стоит удвоение частичных сумм.
+        //
+        // Бюджет разделяемой памяти при сплите 128 (числа из cuobjdump):
+        //   MAX_GQA 6, тайл 1: 13632, вторая строка добавляет 9024 -> 22656, влезает
+        //   MAX_GQA 8, тайл 1: 16256, вторая строка добавляет 10624 -> 26880, нет
+        // Порог четырёх блоков на мультипроцессор — 25344 байта. Поэтому широкий
+        // тайл существует только в варианте на шесть голов GQA; при gqa_ratio 6
+        // этого ровно достаточно, чтобы обойтись одним блоком по головам.
+        ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 2>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+        // Тайл на три строки укладывает типичный шаг MTP (n_q = 3) в один блок
+        // вместо двух, но просит 31680 байт разделяемой памяти — это три блока
+        // на мультипроцессор вместо четырёх. Размен проверяется замером.
+        ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 3>(
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
     } else if constexpr (D == 128) {
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 4, K_BITS, V_BITS>(
             best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
@@ -1027,11 +1188,11 @@ ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
     return best;
 }
 
-template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>
+template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS, int Q_TILE = 1>
 static void ggml_cuda_fattn_kvarn_decode_launch_geometry(
         const ggml_cuda_fattn_kvarn_decode_args & args,
         const dim3 blocks_split) {
-    ggml_cuda_fattn_kvarn_decode_mma_kernel<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS>
+    ggml_cuda_fattn_kvarn_decode_mma_kernel<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS, Q_TILE>
         <<<blocks_split, dim3(args.wave_size, NWARPS, 1), 0, args.stream>>>(
             args.Q, args.k_descs, args.v_descs, args.mask, args.partial, args.partial_meta,
             args.scale, args.logit_softcap, args.nb01, args.nb02, args.nb03,
@@ -1057,6 +1218,16 @@ static void ggml_cuda_fattn_kvarn_decode_launch_gqa(
             ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 64, 8, K_BITS, V_BITS>(args, blocks_split);
             return;
         }
+        // Проверка широкого тайла обязана идти ПЕРЕД общей веткой сплита 128,
+        // иначе та перехватит запуск и тайл никогда не выполнится.
+        if (args.split_tokens == 128 && args.nwarps == 8 && args.q_tile == 3 && MAX_GQA == 6) {
+            ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 128, 8, K_BITS, V_BITS, 3>(args, blocks_split);
+            return;
+        }
+        if (args.split_tokens == 128 && args.nwarps == 8 && args.q_tile == 2 && MAX_GQA == 6) {
+            ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 128, 8, K_BITS, V_BITS, 2>(args, blocks_split);
+            return;
+        }
         if (args.split_tokens == 128 && args.nwarps == 8) {
             ggml_cuda_fattn_kvarn_decode_launch_geometry<D, MAX_GQA, 128, 8, K_BITS, V_BITS>(args, blocks_split);
             return;
@@ -1073,9 +1244,14 @@ static void ggml_cuda_fattn_kvarn_decode_launch_gqa(
 
 template<int D, int K_BITS, int V_BITS>
 void ggml_cuda_fattn_kvarn_decode_launch(const ggml_cuda_fattn_kvarn_decode_args & args) {
+    // Строки запроса делятся на тайлы: один блок ведёт q_tile строк сразу, и
+    // именно на столько же падает число блоков, а вместе с ним — повторная
+    // распаковка записей кэша.
+    const int q_tile = args.q_tile > 0 ? args.q_tile : 1;
+    const int n_q_tiles = (args.n_q + q_tile - 1) / q_tile;
     const dim3 blocks_split(
         (uint32_t) args.n_splits,
-        (uint32_t) (args.n_kv_heads * args.n_gqa_blocks * args.n_q),
+        (uint32_t) (args.n_kv_heads * args.n_gqa_blocks * n_q_tiles),
         (uint32_t) args.n_stream);
 
     if (args.gqa_per_block == 6) {
