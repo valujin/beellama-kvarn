@@ -11,6 +11,9 @@
 .DS_Store
 
 build*/
+# build*/ цепляет и файл build-xcframework.sh: в .dockerignore
+# завершающий слэш не ограничивает совпадение каталогами.
+!build-xcframework.sh
 
 tools/ui/node_modules/
 
