@@ -353,7 +353,9 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
         const std::vector<uint32_t> & occupied_cells,
         const std::vector<uint32_t> & pending_cells,
         uint32_t capacity,
-        uint32_t padding) {
+        uint32_t padding,
+        uint32_t group_align,
+        uint32_t align_growth_percent) {
     if (capacity == 0 || padding == 0) {
         throw std::invalid_argument("invalid KVarN compact read-plan extent");
     }
@@ -388,6 +390,66 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
     }
 
     const uint32_t used = uint32_t(cells.size());
+
+    // ВЫРАВНИВАНИЕ ПО ГРУППЕ ЗАПИСИ.
+    //
+    // Ядро декода берёт быстрый путь чтения K только когда весь сплит лежит
+    // внутри одной группы записи: `k_split_in_group` требует
+    // `pos_begin + SPLIT_TOKENS <= KVAR_N_GROUP`, где `pos_begin` - остаток
+    // физической ячейки первого элемента сплита по модулю размера группы.
+    // Плотный план укладывает занятые ячейки подряд, поэтому при дырках в
+    // арене (а в объединённом кэше они есть всегда: группы разных
+    // последовательностей чередуются) сплит начинается посреди группы, и K
+    // читается ПОЭЛЕМЕНТНО через load_rotated с рантайм-битностью вместо
+    // распаковки строки записи 32-битными словами.
+    //
+    // Замер счётчиками в ядре (Qwen3.6-35B-A3B, глубина 10000, четыре
+    // одновременных запроса, общий кэш): k_split_in_group срабатывал
+    // 0 раз из 528 блоков, средний pos_begin равнялся 100.
+    //
+    // Здесь каждая затронутая группа занимает РОВНО group_align элементов
+    // плана: полная группа отдаёт свои ячейки подряд (pos_begin становится
+    // нулём), неполная отдаёт свои ячейки и добивается -1. Дырка внутри группы
+    // сдвигала бы всё, что за ней, поэтому неполная группа быстрый путь не
+    // получает - но таких групп по одной на последовательность.
+    //
+    // Защита от фрагментации: если выравненный план вырос бы больше чем на
+    // align_growth_percent процентов, возвращаемся к плотному плану.
+    if (group_align > 0) {
+        std::vector<uint32_t> groups;
+        groups.reserve(cells.size()/group_align + 8);
+        std::vector<bool> group_seen((capacity + group_align - 1u)/group_align, false);
+        for (const uint32_t cell : cells) {
+            const uint32_t g = cell/group_align;
+            if (!group_seen[g]) {
+                group_seen[g] = true;
+                groups.push_back(g);
+            }
+        }
+        std::sort(groups.begin(), groups.end());
+        const uint64_t aligned_used = uint64_t(groups.size())*group_align;
+        const uint64_t limit = uint64_t(used)*(100u + align_growth_percent)/100u;
+        if (aligned_used <= limit && aligned_used <= capacity) {
+            const uint32_t aligned_padded = std::min<uint64_t>(capacity,
+                    std::max<uint64_t>(padding,
+                        ((aligned_used + padding - 1u)/padding)*padding));
+            std::vector<int64_t> aligned(aligned_padded, -1);
+            size_t out = 0;
+            for (const uint32_t g : groups) {
+                const uint32_t begin = g*group_align;
+                const uint32_t end = std::min(begin + group_align, capacity);
+                size_t slot = out;
+                for (uint32_t cell = begin; cell < end; ++cell) {
+                    if (seen[cell]) {
+                        aligned[slot++] = int64_t(cell);
+                    }
+                }
+                out += group_align;
+            }
+            return aligned;
+        }
+    }
+
     const uint32_t padded = std::min(capacity,
             std::max(padding, ((used + padding - 1u)/padding)*padding));
     std::vector<int64_t> result(padded, -1);

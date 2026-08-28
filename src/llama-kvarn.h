@@ -126,7 +126,9 @@ std::vector<int64_t> llama_kvarn_compact_read_plan(
         const std::vector<uint32_t> & occupied_cells,
         const std::vector<uint32_t> & pending_cells,
         uint32_t capacity,
-        uint32_t padding);
+        uint32_t padding,
+        uint32_t group_align = 0,
+        uint32_t align_growth_percent = 25);
 
 template<typename SeqPosMax>
 bool llama_kvarn_stream_is_exclusive_for(

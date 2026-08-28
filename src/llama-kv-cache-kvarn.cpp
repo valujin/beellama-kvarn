@@ -832,7 +832,17 @@ const std::vector<int64_t> & llama_kv_cache_kvarn_context::compact_read_plan() c
         GGML_ASSERT(current_sinfo().n_stream() == 1);
         pending.assign(current_sinfo().idxs[0].begin(), current_sinfo().idxs[0].end());
     }
-    compact_read_plan_cache = llama_kvarn_compact_read_plan(occupied, pending, cells.size(), 256);
+    // Выравнивание плана по границе группы записи включено по умолчанию: без
+    // него ядро декода никогда не берёт быстрый путь чтения K в объединённом
+    // кэше (см. комментарий в llama_kvarn_compact_read_plan).
+    // LLAMA_KVARN_PLAN_ALIGN=0 возвращает плотный план для сверки.
+    static const bool align_plan = [] {
+        const char * env = getenv("LLAMA_KVARN_PLAN_ALIGN");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    compact_read_plan_cache = llama_kvarn_compact_read_plan(
+            occupied, pending, cells.size(), 256,
+            align_plan ? uint32_t(KVAR_N_GROUP) : 0u);
     return compact_read_plan_cache;
 }
 
