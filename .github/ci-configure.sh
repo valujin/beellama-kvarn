@@ -8,6 +8,11 @@ set -euo pipefail
 : "${GCC_CPU:=16}"
 : "${GCC_CUDA:=15}"
 
+# Внутри контейнера каталог принадлежит другому пользователю, и git отказывается
+# с ним работать ("dubious ownership"). Без этого cmake не определяет коммит, и
+# образ получает version "build 0, commit unknown-dirty" вместо настоящего.
+git config --global --add safe.directory "$PWD" || true
+
 # Политика маршрутов — чистая функция без зависимостей от CUDA. Проверяем до
 # многочасовой сборки ядер, а не после.
 g++ -std=c++17 -O0 -o /tmp/rp-test tests/test-cuda-fattn-route-policy.cpp
