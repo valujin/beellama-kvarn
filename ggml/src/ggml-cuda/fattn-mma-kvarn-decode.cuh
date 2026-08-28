@@ -299,6 +299,42 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     const int gqa_head_count = min(MAX_GQA, gqa_ratio - gqa_block * MAX_GQA);
     const int token_begin = split * SPLIT_TOKENS;
     const int token_end = min(n_kv, token_begin + SPLIT_TOKENS);
+
+    // Пропуск полностью замаскированного сплита.
+    //
+    // При объединённом кэше (--kv-unified) ячейки чужой последовательности
+    // замаскированы целиком. Ядро всё равно распаковывало для них полный тайл,
+    // а объединение потом отбрасывало результат: при маске -inf все веса
+    // софтмакса равны нулю, знаменатель выходит нулевым, и partial тоже нулевой.
+    // Проверка маски заранее убирает эту работу, не меняя результата.
+    //
+    // Замер батчинга показывает ровно эту трату: два слота против одного дают
+    // у q8_0 совокупный прирост 1.24x, а у KVarN 0.99x. Апстрим лечит то же
+    // самое отдельным проходом flash_attn_mask_to_KV_max — тот находит
+    // последнюю живую позицию и обрезает хвост. Такая граница спасает только ту
+    // последовательность, что лежит в кэше первой; проверка по сплиту работает
+    // для обеих, потому что каждый блок и так независим.
+    //
+    // Скипаем только полный сплит: у последнего, неполного, позиции за token_end
+    // несут -FLT_MAX/2 без маски, и знаменатель у него бывает ненулевым.
+    if (mask != nullptr && token_end - token_begin == SPLIT_TOKENS) {
+        const char * mask_base = mask + nb33 * (stream % ne33) + nb31 * q_index;
+        int live = 0;
+        for (int token = token_begin + tid; token < token_end;
+                token += NWARPS * PHYSICAL_WAVE_SIZE) {
+            const half mv = *(const half *) (mask_base + nb30 * token);
+            live |= !__hisinf(mv);
+        }
+        if (__syncthreads_or(live) == 0) {
+            if (tid < gqa_head_count && q_head0 + tid < n_q_heads) {
+                const size_t base =
+                    (((size_t) stream * n_q + q_index) * n_q_heads + (q_head0 + tid)) *
+                    (size_t) n_splits + split;
+                partial_meta[base] = make_float2(-FLT_MAX / 2.0f, 0.0f);
+            }
+            return;
+        }
+    }
     const int group = token_begin / GGML_CUDA_FATTN_KVARN_DIM;
     const int group_pos_begin = token_begin - group * GGML_CUDA_FATTN_KVARN_DIM;
     const ggml_cuda_fattn_kvarn_decode_tile k_tile =
@@ -722,8 +758,16 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
         float out = 0.0f;
         if (denom > 0.0f) {
             for (int split = 0; split < n_splits; ++split) {
+                // Пропущенные сплиты не писали partial вовсе, а раньше писали
+                // туда нули: прибавить ноль и не прибавлять ничего — одно и то
+                // же значение. Заодно это убирает половину чтений partial при
+                // двух последовательностях в объединённом кэше.
+                const float weight = split_weights[split];
+                if (weight == 0.0f) {
+                    continue;
+                }
                 const size_t base = (((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split;
-                out += split_weights[split] * partial[base * D + dim];
+                out += weight * partial[base * D + dim];
             }
             out /= denom;
         }
