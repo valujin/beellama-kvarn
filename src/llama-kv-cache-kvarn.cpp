@@ -652,10 +652,23 @@ llama_kv_cache_context * llama_kv_cache_kvarn_context::base() const {
 }
 
 bool llama_kv_cache_kvarn_context::next() {
+    // Контекст создаётся один на весь батч (llama_kv_cache_kvarn::init_batch),
+    // а next() лишь переводит базовый контекст на следующий ubatch. План
+    // компактного чтения строится по составу занятых ячеек и по sinfo текущего
+    // ubatch'а, поэтому мемоизацию надо сбросить: иначе второй и последующие
+    // ubatch'и продолжат читать набор ячеек первого, а записанные ими ячейки
+    // (включая их собственные) окажутся вне плана и невидимы для внимания.
+    compact_read_plan_cache.clear();
     return base()->next();
 }
 
 bool llama_kv_cache_kvarn_context::apply() {
+    // apply() фиксирует ячейки текущего ubatch'а в метаданных кэша — ровно то,
+    // из чего строится план, и вызывается ровно один раз перед сборкой графа
+    // (llama_context::process_ubatch). Сбрасываем и здесь, чтобы план в
+    // принципе не мог пережить изменение состояния кэша.
+    compact_read_plan_cache.clear();
+
     if (!base()->apply()) {
         return false;
     }
