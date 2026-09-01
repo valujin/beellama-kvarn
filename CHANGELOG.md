@@ -1,5 +1,100 @@
 # Changelog
 
+## Fork changes — `valujin/beellama-kvarn`
+
+Changes made in this fork on top of [`Anbeeld/beellama.cpp`](https://github.com/Anbeeld/beellama.cpp).
+Upstream's own changelog follows below, unmodified. Every measurement quoted here was
+taken on one machine — a single RTX 3090 (sm_86, 24 GiB) with Qwen3.8-27B `UD-Q4_K_XL`
+served by `llama-server` — and the configuration is stated with each number, because
+these effects depend on context size, depth and slot count. See [README.md](README.md)
+for the full picture.
+
+### Unreleased — since `b15652b0`
+
+- Added `--mmproj-host-weights` (paired `--no-mmproj-host-weights`, or
+  `LLAMA_ARG_MMPROJ_HOST_WEIGHTS`), which places the multimodal projector's weights in
+  pinned host memory while the arithmetic stays on the GPU. Off by default; without the
+  flag no code path reads the environment for this. On the machine above, with
+  Qwen3.8-27B and its vision projector: 886 MiB of VRAM freed, image encoding 5-16%
+  slower, language-model throughput unaffected, and generated text byte-identical to the
+  device-memory baseline — that identity check was run at `--parallel 1` only and says
+  nothing about higher slot counts. Implemented as a weights-only CUDA buffer type
+  (`CUDA_Host_W`) plus a device-staging step in `ggml_cuda_mul_mat_cublas_impl`, since
+  streaming a host-resident weight straight into cuBLAS cost 1540 ms per 1024-token
+  image against 442 ms.
+- Established why upstream keeps this path closed, and that the reason is not what the
+  code comment says. Upstream pins `devices[].integrated` to `false` over corrupted
+  output; the corruption is real but lives neither in the hardware nor in the weights.
+  llama.cpp deliberately places the model's *input* tensors in the same pinned host
+  buffer, and while CUDA declares that buffer type unsupported the scheduler must copy
+  those inputs to the device, synchronizing first — that copy is the only barrier
+  between the CPU writing inputs and the device reading them, since upstream
+  synchronizes explicitly only under `cparams.pipeline_parallel`. Naively opening the
+  gate removes the barrier along with the copy. Confirmed three ways: opening the shared
+  buffer type without moving any projector weight corrupts output with a bit-identical
+  hash; `CUDA_LAUNCH_BLOCKING=1` restores byte-identical output; and the scheduler dump
+  drops from 8 inputs to 0. A separate weights-only buffer type keeps the barrier in
+  place. We believe this analysis explains upstream issue
+  [ggml-org/llama.cpp#25992](https://github.com/ggml-org/llama.cpp/issues/25992), in
+  which a four-slot server returns another request's answer verbatim; we have not
+  reproduced that issue or submitted a fix for it.
+- Taught the MTP draft context to use a KVarN cache, selected with
+  `--spec-draft-type-k/-v kvarn2..kvarn8`. Its single `nextn` layer cost 832.00 MiB in
+  f16 at context 212992 with four slots and costs 131 MiB at `kvarn2`. The real gate was
+  the engine, not the argument parser: the draft context already inherited the target's
+  KVarN request and `llama_init_from_model` shot it down as "target-context-only". This
+  is the one cache where lossy compression cannot change the answer — the MTP head only
+  proposes tokens and the target verifies each one against its own cache — so a weaker
+  draft cache can lower the acceptance rate but not corrupt the output. On the runs
+  measured, acceptance did not fall. The layer-support probe was also fixed to scan the
+  layers an MTP context actually caches (`il >= n_layer()`) rather than the trunk.
+  Default behaviour is unchanged: without these flags the draft cache stays f16.
+- Fixed the KV cache advertising a suffix-rollback limit it does not enforce.
+  `get_seq_rm_capability()` reported `tail_rollback_tokens` for overlay and
+  metadata-only tails, while `can_seq_rm()` applies that bound to bodyless tails alone.
+  The server read the false claim and created a checkpoint on every speculation round,
+  serializing the whole draft cache through a quadratic path. The advertised bound now
+  matches the implementation (KVarN clamps it to `KVAR_N_GROUP` = 128), and the tail
+  serializer shares one pass over the stream's cells instead of rescanning per entry.
+  At context 212992, four slots, depth 20115, `kvarn2` draft, `--spec-draft-n-max 2`:
+  42.70 → 59.40 tok/s, GPU utilization 63% → 99%. The same quadratic pass cost 8.2% of
+  prompt processing on `--ctx-checkpoints`.
+- Fixed a server abort on every image request when the MTP draft cache runs on KVarN.
+  The server demanded an exact rollback of the *draft* context at a boundary taken from
+  the *target* (`ckpt.pos_max + 1`), but the MTP draft numbers its positions by token
+  count. On M-RoPE models an image occupies thousands of tokens and a handful of
+  positions, so the axes diverge — 2091 tokens apart, constant, on a 2209-token prompt —
+  and KVarN legitimately refused a rollback that deep. The boundary is now
+  `ckpt.n_tokens`, the draft's own axis, identical to the old value on text. A retreat
+  order (exact suffix → the memory's own extended plan → full sequence clear) replaces
+  the abort, and the KVarN refusal now prints the numbers needed to diagnose it.
+- Fixed an out-of-bounds shared-memory read in the CUDA KVarN decode kernel. `p_sh` was
+  declared with `MAX_GQA` (6) rows while `load_ldmatrix` reads a fixed 8, so the last
+  row of the tile read past the array. Observable output was unaffected — the extra rows
+  produce output elements discarded by `head < gqa_head_count` — but the read was real.
+  Fixed the same way as the neighbouring `q_sh`: pad to 8 rows and zero the padding. The
+  extra 544 bytes per tile row keep every geometry in its previous occupancy class,
+  confirmed by measurement and a byte-for-byte output comparison.
+- Set the thread count on every scheduler backend that accepts one, not just the CPU
+  backend. With `-mmdev` the projector's second backend can be an ACCEL device that
+  computes on the CPU (ZenDNN), which otherwise stayed at `GGML_DEFAULT_N_THREADS` = 4
+  regardless of `--threads`. No-op for CUDA and Metal.
+- Removed comment references to a research journal that is not part of this repository.
+
+Not settled: with a KVarN draft cache at `--parallel 1`, `--spec-draft-n-max 2`, depth
+~2123 and one specific prompt, the first request after a server start yields a different
+(equally stable, not corrupted) continuation from every request after it; a nine-token
+warm-up request removes it for the life of the process, and `GGML_KVARN_SPLIT_MAX_Q=1`
+removes it entirely, which places it in the split-decode route at `n_q > 1`. Draft
+checkpoints, uninitialized memory, lazy geometry selection, the `p_sh` fix and CUDA
+graphs are ruled out by measurement; the cause is not found. Separately, the `kvarn2`
+draft cache measured a marginally *higher* acceptance rate than f16 (0.778 vs 0.769 at
+`n_max 2`, 0.875 vs 0.871 at `n_max 1`, depth 45283) and we cannot explain why.
+
+---
+
+*Everything below is upstream's changelog, unchanged.*
+
 ## v0.4.4
 
 - Updated the llama.cpp base through upstream commit `84e908c6`. Notable inherited changes include Granite-Switch and Muse Glimmer model support, MTP support for Nemotron and DFlash support for Nemotron 3.5, Pocket TTS audio generation, multi-output backend sampling for speculative decoding, media-aware server slot save/restore, the Web UI `read_media` tool, and expanded tool isolation through SSH and rootless Podman. The merge also adds the default `load-mode auto` policy that avoids memory mapping on integrated GPUs, Vulkan TQ2_0 support, a warp-per-row CUDA WKV7 kernel for single-token decode, narrower CUDA-graph synchronization, hardened GGUF loading, semantic versioning, and version-aware CMake package metadata.
