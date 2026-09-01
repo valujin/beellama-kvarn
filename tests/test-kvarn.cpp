@@ -5755,7 +5755,7 @@ int main() {
     // preview-v0.4.4, то есть это пре-существующее поведение, а не наша правка.
     // Проверка оставлена за переменной, а не включена в набор: чинить
     // процессорный стор — правка продуктового кода со своей регрессией, и она
-    // в эту волну не входила. Разбор — в FINDINGS.
+    // сюда не входила.
     if (std::getenv("KVARN_STAGE_WRITE_THROUGH_CPU") != nullptr) {
         test_stage_write_through_live_group(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6, 1, 3);
         test_stage_write_through_live_group(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6, 1, 5);
