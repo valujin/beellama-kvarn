@@ -5543,14 +5543,29 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             GGML_ABORT("Unknown projector type");
     }
 
-    // ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
-    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend_cpu);
-    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    if (reg) {
+    // Число потоков надо задать КАЖДОМУ бэкенду планировщика, который умеет его
+    // принимать, а не только CPU. Иначе считающий на процессоре ACCEL-бэкенд
+    // (ZenDNN, выбираемый флагом -mmdev) остаётся на GGML_DEFAULT_N_THREADS = 4.
+    // Для CUDA/Metal это пустая операция: символа ggml_backend_set_n_threads у
+    // них нет, указатель окажется nullptr.
+    auto clip_set_n_threads = [&](ggml_backend_t be) {
+        if (be == nullptr) {
+            return;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(be);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg) {
+            return;
+        }
         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (ggml_backend_set_n_threads_fn) {
-            ggml_backend_set_n_threads_fn(ctx->backend_cpu, params->n_threads);
+            ggml_backend_set_n_threads_fn(be, params->n_threads);
         }
+    };
+
+    clip_set_n_threads(ctx->backend_cpu);
+    if (ctx->backend != ctx->backend_cpu) {
+        clip_set_n_threads(ctx->backend);
     }
 
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
