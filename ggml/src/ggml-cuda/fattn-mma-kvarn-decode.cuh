@@ -261,6 +261,15 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     // но само чтение было некорректным.
     constexpr int Q_ROWS = MAX_GQA < 8 ? 8 : MAX_GQA;
     constexpr int P_STRIDE2 = SPLIT_TOKENS / 2 + 4;
+    // Ровно та же беда, что была у q_sh, и лечится тем же приёмом. Операнд B
+    // матричного умножения — tile<8, 8, half2>, поэтому load_ldmatrix ниже
+    // читает из p_sh ФИКСИРОВАННЫЕ 8 строк по P_STRIDE2. При MAX_GQA == 6
+    // массив объявлялся на шесть строк, и для последней строки тайла
+    // (qt == Q_TILE - 1) чтение уходило ЗА массив. На результат это не влияло:
+    // лишние строки дают элементы выхода с j == 6, 7, а они отбрасываются по
+    // `head < gqa_head_count` при записи в partial. Но чтение было настоящим
+    // выходом за границу.
+    constexpr int P_ROWS = MAX_GQA < 8 ? 8 : MAX_GQA;
 
     using T_A = tile<16, 8, half2>;
     using T_B = tile<8, 8, half2>;
@@ -289,7 +298,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     // блока на мультипроцессор сохраняются.
     __shared__ __align__(16) float score_partial_sh[NWARPS][MAX_GQA * TOKENS_PER_CHUNK];
     __shared__ __align__(16) float score_sh[Q_TILE][MAX_GQA][SPLIT_TOKENS];
-    __shared__ __align__(16) half2 p_sh[Q_TILE][MAX_GQA][P_STRIDE2];
+    __shared__ __align__(16) half2 p_sh[Q_TILE][P_ROWS][P_STRIDE2];
     // Оси квантования лежат в записи как half и раньше раскладывались в shared
     // как float. Точности это не добавляло ни одного бита — значение уже прошло
     // округление до half при записи, — зато стоило вдвое больше байт shared и
@@ -587,6 +596,16 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
 #pragma unroll
     for (int qt = 0; qt < Q_TILE; ++qt) {
         half * p_h = (half *) p_sh[qt];
+        // Строки MAX_GQA..P_ROWS-1 нужны только затем, чтобы load_ldmatrix читал
+        // ВНУТРИ массива. Ниже их не пишет никто, поэтому обнуляем здесь: q_sh
+        // поступает так же (там лишние строки получают 0.0f в общем цикле
+        // заполнения). Наблюдаемый результат от этого не меняется — элементы
+        // выхода с j >= gqa_head_count всё равно отбрасываются, — но чтение
+        // перестаёт быть чтением неинициализированной разделяемой памяти.
+        for (int i = tid; i < (P_ROWS - MAX_GQA) * (2 * P_STRIDE2);
+                 i += NWARPS * PHYSICAL_WAVE_SIZE) {
+            p_h[MAX_GQA * (2 * P_STRIDE2) + i] = __float2half(0.0f);
+        }
 #if defined(GGML_USE_HIP) && defined(CDNA)
         if (tid < MAX_GQA) {
             const int h = tid;
@@ -1146,12 +1165,19 @@ ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
         // сверху. Экономия на распаковке реальна, но она вдвое меньше того, что
         // стоит удвоение частичных сумм.
         //
-        // Бюджет разделяемой памяти при сплите 128 (числа из cuobjdump):
-        //   MAX_GQA 6, тайл 1: 13632, вторая строка добавляет 9024 -> 22656, влезает
-        //   MAX_GQA 8, тайл 1: 16256, вторая строка добавляет 10624 -> 26880, нет
-        // Порог четырёх блоков на мультипроцессор — 25344 байта. Поэтому широкий
-        // тайл существует только в варианте на шесть голов GQA; при gqa_ratio 6
-        // этого ровно достаточно, чтобы обойтись одним блоком по головам.
+        // Бюджет разделяемой памяти при сплите 128 (числа из cuobjdump).
+        // Добивка p_sh до P_ROWS == 8 добавила по 544 байта на строку
+        // тайла ((8 - 6) * P_STRIDE2 * sizeof(half2) = 2 * 68 * 4).
+        //   MAX_GQA 6, тайл 1: 13632 -> 14176, вторая строка -> 23744, влезает
+        //   MAX_GQA 8, тайл 1: 16256 -> 16256 (там P_ROWS == MAX_GQA, роста нет)
+        // Порог четырёх блоков на мультипроцессор — 25344 байта, и 23744 в него
+        // по-прежнему укладывается. Тайл на три строки: 31680 -> 33312 при
+        // пороге трёх блоков 33792 — тоже укладывается, но запас всего 480 байт.
+        // ПРОВЕРЕНО ЗАМЕРОМ, а не расчётом: GGML_CUDA_FA_ROUTE_DEBUG=1 на v24
+        // печатает active_blocks_per_sm=4 при той же геометрии, что и v23.
+        // Поэтому широкий тайл существует только в варианте на шесть голов GQA;
+        // при gqa_ratio 6 этого ровно достаточно, чтобы обойтись одним блоком
+        // по головам.
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 2>(
             best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         // Тайл на три строки укладывает типичный шаг MTP (n_q = 3) в один блок
