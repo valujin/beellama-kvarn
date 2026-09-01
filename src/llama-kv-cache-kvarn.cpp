@@ -1816,7 +1816,19 @@ bool llama_kv_cache_kvarn::get_can_shift() const {
 }
 
 llama_memory_i::seq_rm_capability llama_kv_cache_kvarn::get_seq_rm_capability() const {
-    return metadata->get_seq_rm_capability();
+    auto capability = metadata->get_seq_rm_capability();
+    // The metadata cache alone does not describe what this cache can undo:
+    // can_remove() puts the KVarN group rule on top of it. That rule
+    // (llama_kvarn_can_remove_range) accepts any suffix whose start stays at or
+    // after max(0, live_group - 1) * KVAR_N_GROUP, so counting back from
+    // pos_max at least KVAR_N_GROUP tokens are always removable in place -
+    // the worst case is pos_max exactly on a group boundary, where the previous
+    // group is still resident in its own F16 stage slot (tail_groups = 2).
+    // Anything deeper is refused, hence the clamp rather than a pass-through.
+    capability.arbitrary_ranges = false;
+    capability.suffix_rollback_tokens = std::min(
+            capability.suffix_rollback_tokens, uint32_t(KVAR_N_GROUP));
+    return capability;
 }
 
 void llama_kv_cache_kvarn::clear(bool data) {

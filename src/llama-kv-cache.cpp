@@ -1343,10 +1343,22 @@ void llama_kv_cache::clear(bool data) {
 
 llama_memory_i::seq_rm_capability llama_kv_cache::get_seq_rm_capability() const {
     if (has_compact_tail()) {
+        // The advertised bound has to mirror can_seq_rm(), not undercut it.
+        // can_seq_rm() applies tail_rollback_tokens ONLY to a bodyless tail:
+        // when the tail is an overlay over a body it owns or shares, or when it
+        // is metadata for a structured cache (KVarN records own the body), every
+        // surviving position still lives in that body and an arbitrarily deep
+        // suffix removal costs precision at worst, never data. Reporting the
+        // reserve in that case makes callers believe a rollback they are in fact
+        // allowed to perform needs a durable checkpoint first; the server then
+        // serialises the whole cache on every speculation cycle.
+        const bool suffix_unbounded =
+            tail_metadata_only || tail_plan.has_owned_body || tail_plan.has_shared_body;
         return {
             /* .full_clear = */ true,
             /* .arbitrary_ranges = */ false,
-            /* .suffix_rollback_tokens = */ tail_rollback_tokens,
+            /* .suffix_rollback_tokens = */ suffix_unbounded ?
+                std::numeric_limits<uint32_t>::max() : tail_rollback_tokens,
         };
     }
     return {};
@@ -5749,32 +5761,52 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
 }
 
+// Rank of every cell of one stream among the cells that belong to the state of
+// seq_id, or -1 for a cell that does not. Both tail serialisers need exactly
+// this, and both used to recompute it by scanning the cells from zero FOR EVERY
+// tail entry: O(tail_entries * n_cells), with a seq_pos_max() map lookup inside
+// the inner loop. With --kv-tail-tokens 1024 on a 45k-token context that is tens
+// of milliseconds per serialisation, spent entirely on the host while the device
+// idles. One pass produces the same answer.
+std::vector<int32_t> llama_kv_cache::state_tail_cell_ordinals(
+        llama_seq_id seq_id, uint32_t stream) const {
+    const auto & cells = v_cells[stream];
+    std::vector<int32_t> ordinals(cells.size(), -1);
+    // seq_pos_max() does not change while this loop runs; the original hoisted
+    // nothing and paid for it on every cell.
+    const llama_pos pos_max = seq_id == -1 ? 0 : cells.seq_pos_max(seq_id);
+    int32_t ordinal = 0;
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        bool included = !cells.is_empty(cell) && (seq_id == -1 || cells.seq_has(cell, seq_id));
+        if (included && seq_id != -1) {
+            included = !llama_hparams::is_masked_swa(
+                    n_swa, swa_type, cells.pos_get(cell), pos_max);
+        }
+        if (!included) {
+            continue;
+        }
+        ordinals[cell] = ordinal++;
+    }
+    return ordinals;
+}
+
 std::vector<int32_t> llama_kv_cache::state_tail_payload_slots(llama_seq_id seq_id) const {
     GGML_ASSERT(tail);
 
     std::vector<int32_t> result;
     std::unordered_map<int32_t, uint32_t> payload_by_slot;
+    std::unordered_map<uint32_t, std::vector<int32_t>> ordinals_by_stream;
     for (const auto & entry : tail->snapshot(seq_id)) {
         if (entry.identity.stream >= v_cells.size()) {
             continue;
         }
-        const auto & cells = v_cells[entry.identity.stream];
-        bool found = false;
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            bool included = !cells.is_empty(cell) && (seq_id == -1 || cells.seq_has(cell, seq_id));
-            if (included && seq_id != -1) {
-                included = !llama_hparams::is_masked_swa(
-                        n_swa, swa_type, cells.pos_get(cell), cells.seq_pos_max(seq_id));
-            }
-            if (!included) {
-                continue;
-            }
-            if (cell == entry.identity.cell) {
-                found = true;
-                break;
-            }
+        auto ordinals = ordinals_by_stream.find(entry.identity.stream);
+        if (ordinals == ordinals_by_stream.end()) {
+            ordinals = ordinals_by_stream.emplace(entry.identity.stream,
+                    state_tail_cell_ordinals(seq_id, entry.identity.stream)).first;
         }
-        if (!found) {
+        if (entry.identity.cell >= ordinals->second.size() ||
+                ordinals->second[entry.identity.cell] < 0) {
             continue;
         }
         if (payload_by_slot.emplace(entry.slot, uint32_t(result.size())).second) {
@@ -5929,31 +5961,21 @@ void llama_kv_cache::state_write_tail(llama_io_write_i & io, llama_seq_id seq_id
         payload_by_slot.emplace(payload_slots[payload], payload);
     }
 
+    std::unordered_map<uint32_t, std::vector<int32_t>> ordinals_by_stream;
     for (const auto & entry : tail->snapshot(seq_id)) {
         if (entry.identity.stream >= v_cells.size()) {
             continue;
         }
-        const auto & cells = v_cells[entry.identity.stream];
-        uint32_t ordinal = 0;
-        bool found = false;
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            bool included = !cells.is_empty(cell) && (seq_id == -1 || cells.seq_has(cell, seq_id));
-            if (included && seq_id != -1) {
-                included = !llama_hparams::is_masked_swa(
-                        n_swa, swa_type, cells.pos_get(cell), cells.seq_pos_max(seq_id));
-            }
-            if (!included) {
-                continue;
-            }
-            if (cell == entry.identity.cell) {
-                found = true;
-                break;
-            }
-            ++ordinal;
+        auto ordinals = ordinals_by_stream.find(entry.identity.stream);
+        if (ordinals == ordinals_by_stream.end()) {
+            ordinals = ordinals_by_stream.emplace(entry.identity.stream,
+                    state_tail_cell_ordinals(seq_id, entry.identity.stream)).first;
         }
-        if (!found) {
+        if (entry.identity.cell >= ordinals->second.size() ||
+                ordinals->second[entry.identity.cell] < 0) {
             continue;
         }
+        const uint32_t ordinal = uint32_t(ordinals->second[entry.identity.cell]);
 
         const auto it = payload_by_slot.find(entry.slot);
         GGML_ASSERT(it != payload_by_slot.end());
