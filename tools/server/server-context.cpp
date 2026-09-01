@@ -3429,8 +3429,63 @@ private:
                     }
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                // Откат чернового контекста не имеет права ронять сервер.
+                // Черновой кэш — только источник ПРЕДЛОЖЕНИЙ, каждое из которых
+                // всё равно проверяется целевой моделью, поэтому потеря лишних
+                // строк в нём портит приём, но не вывод. А структурные кэши
+                // (KVarN) законно отказывают в слишком глубоком суффиксе: у них
+                // точный откат гарантирован только на KVAR_N_GROUP токенов.
+                // Наблюдавшийся отказ: картинка черновику не отдаётся
+                // (common/speculative.cpp, process() выходит на
+                // batch_in.embd != nullptr), позиции чернового кэша расходятся
+                // с целевыми, и безусловное требование точного отката
+                // упиралось в GGML_ABORT.
+                //
+                // Порядок отступления: точный суффикс -> расширенный (его
+                // считает сама память) -> полная очистка последовательности.
+                // Полная очистка разрешена любому кэшу всегда.
+                {
+                    auto * mem_dft = llama_get_memory(ctx_dft);
+                    // Откат идёт по оси ЧЕРНОВОГО контекста, а не целевого.
+                    // Черновик размечает свои токены позициями n_past + i, где
+                    // n_past = slot.prompt.n_tokens() (заполнение
+                    // common_speculative_get_draft_params выше и симметричный
+                    // откат в common/speculative.cpp: llama_memory_seq_rm(
+                    // mem_dft, seq_id, dparams[seq_id].n_past, -1)). У цели ось
+                    // другая: на моделях с M-RoPE картинка занимает тысячи
+                    // токенов и десятки позиций, поэтому ckpt.pos_max отстаёт от
+                    // черновой оси ровно на эту разницу — аномалия А9.
+                    // ckpt.n_tokens — это и есть n_past на момент снятия точки,
+                    // а на тексте он тождественно равен ckpt.pos_max + 1,
+                    // поэтому поведение форка на тексте не меняется.
+                    const llama_pos rm_p0 = ckpt.n_tokens > 0
+                        ? (llama_pos) ckpt.n_tokens
+                        : ckpt.pos_max + 1;
+
+                    if (!llama_memory_seq_rm(mem_dft, slot.id, rm_p0, -1)) {
+                        llama_pos plan_p0 = -1;
+                        llama_pos plan_p1 = -1;
+                        bool done = false;
+
+                        if (llama_memory_seq_rm_plan(mem_dft, slot.id, rm_p0, -1, &plan_p0, &plan_p1) &&
+                                llama_memory_seq_rm(mem_dft, slot.id, plan_p0, plan_p1)) {
+                            SLT_WRN(slot, "draft rollback widened: [%d, -1) -> [%d, %d)\n",
+                                    rm_p0, plan_p0, plan_p1);
+                            done = true;
+                        } else if (llama_memory_seq_rm(mem_dft, slot.id, -1, -1)) {
+                            SLT_WRN(slot, "draft rollback from %d refused, draft sequence cleared\n", rm_p0);
+                            done = true;
+                        }
+
+                        if (!done) {
+                            GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                        }
+
+                        // Черновой контекст потерял часть строк — предложения
+                        // этого цикла строить не на чем.
+                        draft.clear();
+                        return;
+                    }
                 }
             }
 

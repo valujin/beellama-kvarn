@@ -1911,7 +1911,22 @@ bool llama_kv_cache_kvarn::seq_rm_plan(
 bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     apply_pending_stream_copies(nullptr);
     if (!can_seq_rm(seq_id, p0, p1)) {
-        LLAMA_LOG_WARN("%s: KVarN can only remove a complete sequence or the current/previous fp16 tail groups\n", __func__);
+        // Отказ обязан быть разбираем по журналу: без чисел он не отличает
+        // «слишком глубокий откат» от «сегмента нет в метаданных» и от выхода
+        // seq_id за n_seq_max. Разбор отказа при мультимодальном черновике
+        // упирался ровно в отсутствие этих чисел.
+        const llama_pos pos_max = (seq_id >= 0 && uint32_t(seq_id) < n_seq_max)
+            ? metadata->seq_pos_max(seq_id) : -1;
+        const llama_pos pos_min = (seq_id >= 0 && uint32_t(seq_id) < n_seq_max)
+            ? metadata->seq_pos_min(seq_id) : -1;
+        const llama_pos earliest_exact =
+            std::max<llama_pos>(0, pos_max / llama_pos(KVAR_N_GROUP) - 1) * llama_pos(KVAR_N_GROUP);
+        LLAMA_LOG_WARN("%s: KVarN can only remove a complete sequence or the current/previous fp16 tail groups "
+                       "(seq_id = %d, p0 = %d, p1 = %d, seq_pos_min = %d, seq_pos_max = %d, "
+                       "group = %u, earliest_exact = %d, meta_can_seq_rm = %d)\n",
+                       __func__, seq_id, p0, p1, pos_min, pos_max,
+                       (unsigned) KVAR_N_GROUP, earliest_exact,
+                       (int) metadata->can_seq_rm(seq_id, p0, p1));
         return false;
     }
     return metadata->seq_rm(seq_id, p0, p1);
