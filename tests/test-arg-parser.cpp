@@ -231,8 +231,10 @@ static void test(void) {
     argv = {"binary_name", "--kv-tail-type", "f32"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // kvarn8 IS accepted for the draft context since the MTP draft cache learned
+    // KVarN; only a nonexistent width is still rejected.
     params = common_params();
-    argv = {"binary_name", "--spec-draft-type-k", "kvarn8"};
+    argv = {"binary_name", "--spec-draft-type-k", "kvarn7"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     params = common_params();
@@ -428,6 +430,54 @@ static void test(void) {
     assert(!params.kv_unified);
     assert(common_context_params_to_llama(params).kvarn.type == LLAMA_KVARN_K4V2_G128);
     assert(!common_context_params_to_llama(params).kv_unified);
+
+    // --- draft/MTP KVarN request -------------------------------------------
+    // Default: no draft KVarN request at all, and the speculative params must
+    // NOT inherit the target's KVarN through the `result = params` copy.
+    params = common_params();
+    argv = {
+        "binary_name", "-m", "model_file.gguf",
+        "--cache-type-k", "kvarn4",
+        "--cache-type-v", "kvarn4",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kvarn.type == LLAMA_KVARN_K4V4_G128);
+    assert(params.speculative.draft.cache_kvarn_bits_k == 0);
+    assert(params.speculative.draft.cache_kvarn_bits_v == 0);
+    assert(common_base_params_to_speculative(params).kvarn.type == LLAMA_KVARN_TYPE_DISABLED);
+
+    // Explicit draft request, independent of the target's width.
+    params = common_params();
+    argv = {
+        "binary_name", "-m", "model_file.gguf",
+        "--cache-type-k", "kvarn4",
+        "--cache-type-v", "kvarn4",
+        "--spec-draft-type-k", "kvarn2",
+        "--spec-draft-type-v", "kvarn2",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kvarn.type == LLAMA_KVARN_K4V4_G128);
+    assert(params.speculative.draft.cache_kvarn_bits_k == 2);
+    assert(params.speculative.draft.cache_kvarn_bits_v == 2);
+    assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q2_0S);
+    assert(params.speculative.draft.cache_type_v == GGML_TYPE_Q2_0S);
+    assert(common_base_params_to_speculative(params).kvarn.type == LLAMA_KVARN_K2V2_G128);
+
+    // Half a request is completed, not rejected - same rule as the target.
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "kvarn4"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.speculative.draft.cache_kvarn_bits_k == 4);
+    assert(params.speculative.draft.cache_kvarn_bits_v == 4);
+    assert(common_base_params_to_speculative(params).kvarn.type == LLAMA_KVARN_K4V4_G128);
+
+    // A plain ggml type for the draft leaves the KVarN request switched off.
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.speculative.draft.cache_kvarn_bits_k == 0);
+    assert(params.speculative.draft.cache_type_k == GGML_TYPE_Q8_0);
+    assert(common_base_params_to_speculative(params).kvarn.type == LLAMA_KVARN_TYPE_DISABLED);
 
     params = common_params();
     argv = {

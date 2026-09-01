@@ -436,6 +436,45 @@ static void parse_target_cache_type(common_params & params, bool key, const std:
     }
 }
 
+// The draft/MTP context gets its own KVarN request.  Until now the handler for
+// --spec-draft-type-k/-v went straight to kv_cache_type_from_str(), which only
+// knows ggml tensor types and therefore rejected every kvarn pseudo type with
+// "Unsupported cache type: kvarn4" (anomaly A6).  The draft cache is the one
+// place where lossy compression cannot corrupt the answer: the draft only
+// *proposes* tokens and the target verifies every one of them against its own
+// cache, so a weaker draft cache can only lower the acceptance rate.
+static void parse_draft_cache_type(common_params & params, bool key, const std::string & value) {
+    const int32_t redirected_kvarn_bits = kvarn_bits_from_legacy_cache_type(value);
+    const std::string cache_type = redirected_kvarn_bits != 0
+        ? string_format("kvarn%d", redirected_kvarn_bits)
+        : value;
+
+    if (redirected_kvarn_bits != 0) {
+        LOG_WRN("cache type '%s' was removed in v0.4.0; redirecting to '%s' for the draft context\n",
+                value.c_str(), cache_type.c_str());
+    }
+
+    const int32_t kvarn_bits = kvarn_bits_from_cache_type(cache_type);
+    if (kvarn_bits != 0) {
+        if (key) {
+            params.speculative.draft.cache_kvarn_bits_k = kvarn_bits;
+            params.speculative.draft.cache_type_k = kvarn_fallback_cache_type(kvarn_bits);
+        } else {
+            params.speculative.draft.cache_kvarn_bits_v = kvarn_bits;
+            params.speculative.draft.cache_type_v = kvarn_fallback_cache_type(kvarn_bits);
+        }
+        return;
+    }
+
+    if (key) {
+        params.speculative.draft.cache_kvarn_bits_k = 0;
+        params.speculative.draft.cache_type_k = kv_cache_type_from_str(cache_type);
+    } else {
+        params.speculative.draft.cache_kvarn_bits_v = 0;
+        params.speculative.draft.cache_type_v = kv_cache_type_from_str(cache_type);
+    }
+}
+
 static void parse_target_kvarn_swa_cache_type(common_params & params, bool key, const std::string & value) {
     const int32_t redirected_kvarn_bits = kvarn_bits_from_legacy_cache_type(value);
     const std::string cache_type = redirected_kvarn_bits != 0
@@ -1419,7 +1458,46 @@ static utf8_argv make_utf8_argv() {
 }
 #endif
 
+// Mirror of the target normalization for the draft/MTP context: fill in the
+// missing half, validate the combination, and keep the ggml fallback types in
+// sync.  Unlike the target this never touches params.kvarn - the draft request
+// is carried separately and applied in common_base_params_to_speculative().
+static void common_params_kvarn_normalize_draft(common_params & params) {
+    int32_t key_bits   = params.speculative.draft.cache_kvarn_bits_k;
+    int32_t value_bits = params.speculative.draft.cache_kvarn_bits_v;
+
+    if (key_bits == 0 && value_bits == 0) {
+        return;
+    }
+
+    if (key_bits == 0) {
+        LOG_WRN("warning: --spec-draft-type-v uses KVarN but --spec-draft-type-k is %s; forcing K to kvarn%d\n",
+                kv_cache_type_name(params.speculative.draft.cache_type_k), value_bits);
+        key_bits = value_bits;
+    } else if (value_bits == 0) {
+        LOG_WRN("warning: --spec-draft-type-k uses KVarN but --spec-draft-type-v is %s; forcing V to kvarn%d\n",
+                kv_cache_type_name(params.speculative.draft.cache_type_v), key_bits);
+        value_bits = key_bits;
+    }
+
+    if (kvarn_type_from_bits(key_bits, value_bits) == LLAMA_KVARN_TYPE_INVALID) {
+        throw std::invalid_argument(string_format(
+                "invalid draft KVarN cache type combination: kvarn%d/kvarn%d", key_bits, value_bits));
+    }
+
+    params.speculative.draft.cache_kvarn_bits_k = key_bits;
+    params.speculative.draft.cache_kvarn_bits_v = value_bits;
+    params.speculative.draft.cache_type_k = kvarn_fallback_cache_type(key_bits);
+    params.speculative.draft.cache_type_v = kvarn_fallback_cache_type(value_bits);
+
+    if (params.grp_attn_n != 1) {
+        throw std::invalid_argument("KVarN does not support Self-Extend/group attention; use --grp-attn-n 1");
+    }
+}
+
 static void common_params_kvarn_normalize(common_params & params) {
+    common_params_kvarn_normalize_draft(params);
+
     int32_t key_bits = params.cache_kvarn_bits_k;
     int32_t value_bits = params.cache_kvarn_bits_v;
     const int32_t swa_key_bits = params.cache_kvarn_swa_bits_k;
@@ -4470,11 +4548,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str(),
             kv_cache_type_name(params.speculative.draft.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
+            parse_draft_cache_type(params, /*key =*/ true, value);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -4483,11 +4561,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str(),
             kv_cache_type_name(params.speculative.draft.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
+            parse_draft_cache_type(params, /*key =*/ false, value);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(

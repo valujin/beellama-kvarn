@@ -342,6 +342,14 @@ struct common_params_speculative_draft {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // KVarN pseudo-type request for the draft/MTP context (0 = use the plain
+    // ggml cache type above).  Kept separate from cache_type_k/v for the same
+    // reason the target keeps common_params::cache_kvarn_bits_k/v separate:
+    // KVarN is a cache *structure*, not a ggml tensor type, and the fallback
+    // ggml type must stay meaningful for every path not taught about KVarN.
+    int32_t cache_kvarn_bits_k = 0;
+    int32_t cache_kvarn_bits_v = 0;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

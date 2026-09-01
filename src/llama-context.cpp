@@ -4321,13 +4321,37 @@ llama_context * llama_init_from_model(
     }
 
     if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
-        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model->arch == LLM_ARCH_DFLASH) {
+        // The MTP draft context is the one auxiliary context whose attention
+        // cache is built by exactly the same constructor as the target's - see
+        // llama_model::create_memory(), where an MTP context on a hybrid Qwen3.5
+        // skips the hybrid wrapper and lands on the plain/KVarN branch with the
+        // layer filter `il >= n_layer()`.  Nothing about that geometry is
+        // special apart from holding a single layer, so KVarN can own it.
+        //
+        // Correctness note: the draft cache is the one cache where lossy
+        // compression cannot change the answer.  The MTP head only *proposes*
+        // tokens; every proposal is verified by the target against the target's
+        // own cache.  A weaker draft cache can lower the acceptance rate, it
+        // cannot corrupt the output.
+        const bool kvarn_ctx_supported =
+            params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ||
+            (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model->hparams.n_layer_nextn > 0);
+
+        if (!kvarn_ctx_supported || model->arch == LLM_ARCH_DFLASH) {
             LLAMA_LOG_WARN("%s: KVarN is target-context-only; disabling it for this auxiliary context\n", __func__);
             params.kvarn = llama_kvarn_default_params();
         } else {
+            // An MTP context caches the nextn layers, not the trunk, so the
+            // support probe has to look at exactly the layers that will be
+            // cached.  Probing the trunk here would leave the layer that
+            // actually gets a KVarN cache unchecked.
+            const bool is_mtp_ctx = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+            const uint32_t il_beg = is_mtp_ctx ? model->hparams.n_layer()     : 0;
+            const uint32_t il_end = is_mtp_ctx ? model->hparams.n_layer_all   : model->hparams.n_layer();
+
             bool head_dims_supported = true;
             bool backend_ops_supported = true;
-            for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            for (uint32_t il = il_beg; il < il_end; ++il) {
                 if (!model->hparams.has_kv(il)) {
                     continue;
                 }
@@ -4346,6 +4370,7 @@ llama_context * llama_init_from_model(
                     : params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
             const bool attention_supported =
                 causal_attn &&
+                il_end > il_beg &&
                 model->hparams.n_layer_kv() > 0 &&
                 !model->hparams.is_mla() &&
                 !llm_arch_is_recurrent(model->arch) &&

@@ -2443,6 +2443,33 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+
+    // The draft context inherited params.kvarn from the target through the
+    // `result = params` copy above, which is why llama_init_from_model() had to
+    // shoot it down with "KVarN is target-context-only".  Make the request
+    // explicit instead: the draft cache follows --spec-draft-type-k/-v and
+    // nothing else, so leaving those alone reproduces the previous behaviour
+    // byte for byte (a disabled KVarN request for the draft context).
+    result.cache_kvarn_bits_k = params_spec.cache_kvarn_bits_k;
+    result.cache_kvarn_bits_v = params_spec.cache_kvarn_bits_v;
+    if (params_spec.cache_kvarn_bits_k != 0 && params_spec.cache_kvarn_bits_v != 0) {
+        const std::string name = string_format("kvarn_k%dv%d_g128",
+                params_spec.cache_kvarn_bits_k, params_spec.cache_kvarn_bits_v);
+        const llama_kvarn_type type = llama_kvarn_type_from_name(name.c_str());
+        if (type == LLAMA_KVARN_TYPE_INVALID) {
+            LOG_WRN("%s: invalid draft KVarN type '%s'; the draft cache stays unstructured\n",
+                    __func__, name.c_str());
+            result.kvarn = llama_kvarn_default_params();
+        } else {
+            result.kvarn = llama_kvarn_params_for_type(type);
+            // The draft cache is written and read only by the MTP head; there is
+            // no user-visible tail request for it, so keep the intrinsic suffix.
+            result.kvarn.fail_if_unsupported = params.kvarn.fail_if_unsupported;
+        }
+    } else {
+        result.kvarn = llama_kvarn_default_params();
+    }
+
     result.kv_tail_tokens = "0";
     result.kv_tail_type   = GGML_TYPE_F16;
     result.n_outputs_max = params.n_parallel;
