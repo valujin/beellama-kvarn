@@ -362,6 +362,19 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
     )
 
+    # Охрана патча волны 41 (kvarn-w41-sealed-restore). Тот же приём с моделью:
+    # структурная раскладка KVarN включается только на достаточно широком окне,
+    # поэтому тест сам переписывает context_length у копии модели.
+    llama_build_and_test(test-kv-stage-sealed-restore.cpp
+        LABEL main
+        ARGS -m "${MODEL_DIR}/llama-dense.gguf"
+             --cache-type-k kvarn5 --cache-type-v kvarn5 -ngl 0
+             --kv-tail-tokens 1024
+    )
+    set_tests_properties(test-kv-stage-sealed-restore PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
     llama_test(
         test-recurrent-state-rollback
         LABEL main

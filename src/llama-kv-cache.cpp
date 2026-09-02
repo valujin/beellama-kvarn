@@ -5123,6 +5123,7 @@ void llama_kv_cache::state_v2_read_payload_and_install(
         } else {
             rebuild_allocation_head(seq_id);
         }
+        rebuild_allocation_group_sealed();
         return;
     }
 
@@ -5196,6 +5197,7 @@ void llama_kv_cache::state_v2_read_payload_and_install(
     } else {
         rebuild_allocation_head(seq_id);
     }
+    rebuild_allocation_group_sealed();
 }
 
 bool llama_kv_cache::requires_state_for_partial_restore() const {
@@ -5884,6 +5886,57 @@ void llama_kv_cache::reset_allocation_head(llama_seq_id seq_id) {
 }
 
 
+// Пересобрать липкий признак «группа уже лежит в записях» по фактической
+// раскладке ячеек.
+//
+// Признак живёт ТОЛЬКО в памяти объекта llama_kv_cache и обновляется только в
+// find_slot. Любое восстановление состояния KVarN подменяет ЖИВОЙ кэш
+// метаданных свежим клоном (llama_kv_cache_kvarn::state_read:
+// make_metadata_cache() -> clone_logical_state_from() -> metadata.swap()), а
+// clone_logical_state_from признак не переносит. У клона вектор пуст, засев в
+// find_slot видит несовпадение длины и обнуляет ВСЕ признаки. После этого
+// каждая неполная группа-дыра — а их штатно оставляет спекулятивный откат,
+// переходящий границу группы назад, — снова считается живой незавершённой и
+// занимает слот F16. При --parallel 1 кольцо всего из двух слотов, и две дыры
+// одной чётности дают бросок "structured KV live groups alias one F16 stage
+// slot" прямо посреди декодирования.
+//
+// Правило восстановления берётся у ТОГО ЖЕ предиката, по которому путь
+// полезной нагрузки решает, какие ячейки вообще попадают в стейдж при
+// восстановлении (allocation_cell_uses_stage, вызывается из
+// llama_kv_cache_kvarn::state_read): в стейдже живут группа-якорь и группы,
+// на которые смотрит голова какой-нибудь последовательности. Неполная группа,
+// на которую не смотрит ни одна голова, строк в стейдже не имеет — её
+// префикс уже в записях, значит она запечатана. Так проверка в find_slot
+// перестаёт быть строже действительности.
+//
+// Голов это касается напрямую, поэтому вызывать только ПОСЛЕ
+// rebuild_allocation_head().
+void llama_kv_cache::rebuild_allocation_group_sealed() {
+    if (allocation_group_size <= 1 || n_stream != 1 || v_cells.empty()) {
+        return;
+    }
+    const auto & cells = v_cells[0];
+    const uint32_t n_groups = cells.size()/allocation_group_size;
+    allocation_group_sealed.assign(n_groups, 0);
+    for (uint32_t group = 1; group < n_groups; ++group) {
+        const uint32_t begin = group*allocation_group_size;
+        const uint32_t end = std::min<uint32_t>(begin + allocation_group_size, cells.size());
+        uint32_t used = 0;
+        for (uint32_t cell = begin; cell < end; ++cell) {
+            used += !cells.is_empty(cell);
+        }
+        if (used == 0) {
+            continue;
+        }
+        if (used >= allocation_group_size) {
+            allocation_group_sealed[group] = 1;
+            continue;
+        }
+        allocation_group_sealed[group] = allocation_cell_uses_stage(begin) ? 0 : 1;
+    }
+}
+
 void llama_kv_cache::rebuild_allocation_head(llama_seq_id seq_id) {
     if (seq_id < 0 || uint32_t(seq_id) >= n_seq_max ||
             allocation_group_size <= 1 || n_stream != 1) {
@@ -5929,6 +5982,9 @@ void llama_kv_cache::clone_logical_state_from(const llama_kv_cache & source) {
     }
     v_heads = source.v_heads;
     allocation_seq_heads = source.allocation_seq_heads;
+    // Признак запечатанности — такая же часть логического состояния, как головы:
+    // без него клон считает каждую неполную группу живой и незавершённой.
+    allocation_group_sealed = source.allocation_group_sealed;
     seq_to_stream = source.seq_to_stream;
     tail_generations = source.tail_generations;
     tail_generations_before_batch = source.tail_generations_before_batch;

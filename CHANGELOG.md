@@ -80,6 +80,40 @@ for the full picture.
   computes on the CPU (ZenDNN), which otherwise stayed at `GGML_DEFAULT_N_THREADS` = 4
   regardless of `--threads`. No-op for CUDA and Metal.
 - Removed comment references to a research journal that is not part of this repository.
+- Fixed the `decode() failed: structured KV live groups alias one F16 stage slot` throw
+  reported in issues #1 and #2 — a real defect, not a misconfiguration. KVarN marks a
+  group *sealed* once it has been filled completely: its prefix lives in the record
+  store and it no longer needs a row in the F16 staging ring. That flag lived only in
+  the live cache object, and `clone_logical_state_from()` did not carry it, so every
+  state restore — a context checkpoint or a RAM prompt-cache hit, both of which swap the
+  live metadata cache for a fresh clone — silently dropped it. Sealed-but-incomplete
+  groups arise normally: MTP speculation rolls the cache back to an arbitrary position
+  after each verification step, and a rollback that steps back across a group boundary
+  leaves a full group short a few cells while it stays sealed, so it can never be
+  appended to again. After a restore every one of those holes is counted as a live
+  unfinished group and demands a stage slot; the ring is `2 * --parallel` slots wide and
+  the slot of group `g` is `1 + ((g-1) % tail_groups)`, so at `--parallel 1` there are
+  exactly two and any two holes of the same parity collide at once. The check was
+  stricter than reality — a hole no sequence head looks at has no stage rows to alias.
+  The flag is now carried across the clone and recomputed after a restore from the
+  actual cell layout, using the same `allocation_cell_uses_stage()` predicate the
+  payload path already applies when deciding what is staged. Prefix reuse is not
+  restricted in any way. Raising `--parallel` or `LLAMA_KVARN_TAIL_GROUPS` was never a
+  fix for this: holes accumulate without bound, and a wider ring turns the throw into
+  the worse failure — with two holes on different slots there is no error and the
+  allocator writes new cells straight into a hole whose prefix is in the record store,
+  which the stitching kernel then reads from a stage that no longer holds those rows.
+  On the machine above with Qwen3.8-27B `UD-Q4_K_M`: an accumulating-dialogue
+  reproduction that failed on the 19th turn now runs to the end with no aliasing
+  reported, generated text is byte-identical to the unpatched build at prompt depths
+  1460, 4583 and 12000 at `--parallel 1` and at 4583 with four slots (`temperature 0`,
+  `top_k 1`, `cache_prompt: false`, MTP on), MTP acceptance rates match to the last
+  digit, image output is byte-identical, and throughput is unchanged — the new code runs
+  only on a state restore and makes one pass over the groups. `test-kv-stage-sealed-restore`
+  ships as a CPU-only guard, verified against a clean rebuild of both sides: without the
+  fix it reports 0 sealed incomplete groups instead of 2 and fails. KLD against the
+  reference set was not re-measured; the quality claim here rests on the byte-identical
+  comparisons above, not on KLD.
 
 Not settled: with a KVarN draft cache at `--parallel 1`, `--spec-draft-n-max 2`, depth
 ~2123 and one specific prompt, the first request after a server start yields a different

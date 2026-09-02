@@ -359,6 +359,7 @@ private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void reset_allocation_head(llama_seq_id seq_id);
     void rebuild_allocation_head(llama_seq_id seq_id);
+    void rebuild_allocation_group_sealed();
 
     const llama_model & model;
     const llama_hparams & hparams;
