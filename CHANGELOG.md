@@ -115,15 +115,62 @@ for the full picture.
   reference set was not re-measured; the quality claim here rests on the byte-identical
   comparisons above, not on KLD.
 
-Not settled: with a KVarN draft cache at `--parallel 1`, `--spec-draft-n-max 2`, depth
-~2123 and one specific prompt, the first request after a server start yields a different
-(equally stable, not corrupted) continuation from every request after it; a nine-token
-warm-up request removes it for the life of the process, and `GGML_KVARN_SPLIT_MAX_Q=1`
-removes it entirely, which places it in the split-decode route at `n_q > 1`. Draft
-checkpoints, uninitialized memory, lazy geometry selection, the `p_sh` fix and CUDA
-graphs are ruled out by measurement; the cause is not found. Separately, the `kvarn2`
-draft cache measured a marginally *higher* acceptance rate than f16 (0.778 vs 0.769 at
-`n_max 2`, 0.875 vs 0.871 at `n_max 1`, depth 45283) and we cannot explain why.
+- Fixed the same request at `temperature 0` returning a different answer depending on
+  what had run in that server slot before it. The answer was a function of the *length*
+  of the previous request, not of its content. Two carriers, both process-lifetime state
+  that nothing reset when a new request began.
+
+  First, the f16 tail arena picks a slot through a rotating per-sequence write cursor,
+  and that cursor was cleared only by `clear()` and by a state restore, never by a
+  sequence restart — so a new request laid its tail out rotated by the length of the
+  previous one. Same rows, different places; attention over the tail sums rows in arena
+  order, so the rotation changes the summation order and the rounding. The row-wise trace
+  showed the per-row sums of one run to be a cyclic rotation of the other by 120
+  positions, sign for sign. It reaches the output only through a *quantised draft* cache:
+  the target arena is 1025 slots with the surplus masked off, the draft's is 129 and
+  `KVARN_WHT` rotates all of it. The cursor is now reset when a ubatch carries position 0,
+  along with that stream's tail arena and stage.
+
+  Second, `common_speculative_impl_draft_mtp` kept `pending_h`, `verify_h`,
+  `verify_h_rows`, `i_last` and `chain_h` for the life of the process and cleared them
+  only in the constructor and on the state-read path — `begin()`, which announces a new
+  request, cleared nothing. The first draft batch of a new request writes `pending_h`
+  into its `batch.embd`, so the first draft step was fed the tail of the previous request
+  in that slot. `begin()` now resets all of it, and both drivers zero the `malloc`'d
+  `batch.token`/`batch.embd` at creation rather than inheriting the previous request's
+  remains.
+
+  After both: the recipe returns one sum in five runs of five, a sweep over ten warm-up
+  lengths returns that same sum, output is byte-identical at depths 2000, 20000 and 45000
+  over three runs each, four slots and image input are unaffected.
+  `test-kv-tail-cursor-restart` ships as a CPU-only guard with a negative control.
+
+  This corrects an earlier note in this file. `GGML_KVARN_SPLIT_MAX_Q=1` and
+  `GGML_KVARN_SPLIT_TOKENS=64` appeared to remove the defect and were read as placing it
+  in the split-decode route at `n_q > 1`. They do not fix it — they *move* it: split 64
+  removes the divergence at depth 2300 and creates one at depth 20000. The split-decode
+  route was not the cause.
+- Guard, not a fix: the KVarN split decode no longer depends on `n_q` or on stream
+  history. A tile crossing a record-group boundary is refused the fast path (the general
+  MMA path always refused it, split decode did not, which allowed two arithmetics inside
+  one split); geometry is chosen in two passes so split length — which sets the KV
+  partition and the online-softmax summation order — is picked at `n_q == 1`, identically
+  for a generation step and a draft-verification step; and `partial_meta` is zeroed
+  before launch on both routes, since the combine kernel includes a split when
+  `meta.y > 0` and would otherwise read another launch's leftovers. On every workload
+  measured this is an identity transformation: byte-identical output at depths 2000,
+  20000 and 45000 and throughput equal to within noise (55.62/57.90/51.48 →
+  55.71/57.94/51.49 tok/s). It repairs no observed defect; it makes three properties a
+  guarantee rather than a coincidence.
+- Added the missing barrier in the KVarN split-decode combine kernel, between the
+  block-wide read of `reduce_sh[0]` and thread 0 overwriting it with a partial
+  denominator. Not winnable in practice — thread 0 reaches the store through a global
+  read of `partial_meta` — and it explains none of the differences above, which repeat
+  bit for bit where a race would scatter. Costs nothing: the block synchronizes two lines
+  below regardless, so the barrier only moves earlier.
+
+Still not explained: the `kvarn2` draft cache measured a marginally *higher* acceptance
+rate than f16 (0.778 vs 0.769 at `n_max 2`, 0.875 vs 0.871 at `n_max 1`, depth 45283).
 
 ---
 
