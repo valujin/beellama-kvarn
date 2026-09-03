@@ -462,6 +462,10 @@ public:
             uint32_t local_slot);
     uint32_t state_write_cursor(llama_seq_id seq_id) const;
     void restore_write_cursor(llama_seq_id seq_id, uint32_t cursor);
+    // ВОЛНА 43. Безопасный сброс вращающегося курсора записи: только если у
+    // последовательности НЕТ занятых слотов, то есть она начинается заново.
+    // В отличие от restore_write_cursor не требует, чтобы вызов был вне батча.
+    void reset_write_cursor(llama_seq_id seq_id);
 
     void begin_batch();
     void finish_batch(bool success, bool payload_may_be_modified);

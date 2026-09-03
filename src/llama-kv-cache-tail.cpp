@@ -1,5 +1,8 @@
 #include "llama-kv-cache-tail.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1382,6 +1385,36 @@ uint32_t llama_kv_tail_store::state_write_cursor(llama_seq_id seq_id) const {
         throw std::out_of_range("invalid KV tail sequence cursor");
     }
     return write_cursors[size_t(seq_id)];
+}
+
+void llama_kv_tail_store::reset_write_cursor(llama_seq_id seq_id) {
+    // Условие `in_batch` здесь НЕ проверяется намеренно. Курсор — не
+    // транзакционное состояние, а точка старта поиска свободного слота в
+    // acquire(); откатывать его нечему, и внутри батча он так же законен, как
+    // снаружи. Именно охрана по `in_batch` в первой редакции правки (волна 43)
+    // делала сброс молчаливо недействующим: вызывающая сторона зовёт его из
+    // подготовки ubatch'а, то есть внутри батча. pending_seq_cp и
+    // batch_transaction — настоящие транзакции, их трогать нельзя.
+    //
+    // Печать намеренно НЕ упоминает вызывающую подсистему: этот файл отделён от
+    // неё межмодульным барьером, который сторожит tests/test-std-kv-tail-static.py.
+    const bool blocked = !valid_seq(seq_id) || pending_seq_cp || batch_transaction;
+    if (getenv("LLAMA_KV_TAIL_DEBUG")) {
+        fprintf(stderr, "KVTAIL-CURSOR: seq=%d %s (курсор был %u, stride=%u)\n",
+                (int) seq_id, blocked ? "ОТКАЗ" : "сброс",
+                valid_seq(seq_id) ? write_cursors[size_t(seq_id)] : 0u, arena_stride);
+        fflush(stderr);
+    }
+    if (blocked) {
+        return;
+    }
+    // Последовательность начинается заново: её прежние записи хвоста мертвы.
+    // Сначала отпускаем их (иначе занятые слоты сами по себе несут историю —
+    // acquire ищет ПЕРВЫЙ свободный от курсора), затем ставим курсор в ноль.
+    // Без этого раскладка хвоста нового запроса зависит от того, сколько
+    // токенов слот обработал раньше.
+    seq_rm(seq_id, -1, -1);
+    write_cursors[size_t(seq_id)] = 0;
 }
 
 void llama_kv_tail_store::restore_write_cursor(llama_seq_id seq_id, uint32_t cursor) {

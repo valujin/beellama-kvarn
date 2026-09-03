@@ -342,6 +342,11 @@ public:
             bool value,
             ggml_tensor * mat_idxs = nullptr) const;
     ggml_tensor * get_tail(ggml_context * ctx, int32_t il, bool value) const;
+    // ВОЛНА 43. Обнуление f16-хвоста потока. Вращение KVARN_WHT идёт по ВСЕЙ
+    // арене хвоста (get_tail отдаёт вид на get_tail_slots() слотов), поэтому
+    // слоты, ещё не записанные текущим запросом, вносят в результат остаток
+    // прошлого использования потока. seq_id < 0 — вся арена.
+    void clear_tail_storage(llama_seq_id seq_id);
     ggml_tensor * store_tail(
             ggml_context * ctx, ggml_tensor * current, ggml_tensor * indices,
             int32_t il, bool value, ggml_tensor * dependency = nullptr) const;

@@ -1341,6 +1341,21 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+void llama_kv_cache::reset_tail_write_cursor(llama_seq_id seq_id) {
+    if (!tail) {
+        return;
+    }
+    if (seq_id < 0) {
+        for (uint32_t s = 0; s < n_seq_max; ++s) {
+            tail->reset_write_cursor(llama_seq_id(s));
+        }
+        return;
+    }
+    if (uint32_t(seq_id) < n_seq_max) {
+        tail->reset_write_cursor(seq_id);
+    }
+}
+
 llama_memory_i::seq_rm_capability llama_kv_cache::get_seq_rm_capability() const {
     if (has_compact_tail()) {
         // The advertised bound has to mirror can_seq_rm(), not undercut it.

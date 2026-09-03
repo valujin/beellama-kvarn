@@ -669,9 +669,42 @@ bool llama_kv_cache_kvarn_context::apply() {
     // принципе не мог пережить изменение состояния кэша.
     compact_read_plan_cache.clear();
 
+    // ВОЛНА 43. Начало новой последовательности — обнулить арену f16-хвоста её
+    // потока. Вращение KVARN_WHT идёт по ВСЕЙ арене (get_tail отдаёт вид на
+    // get_tail_slots() слотов), поэтому слоты, которые запрос ещё не переписал,
+    // вносят в результат остаток прошлого использования потока. Обнуления в
+    // seq_rm недостаточно: сервер не всегда удаляет последовательность целиком
+    // перед новым промптом. Здесь же условие ровно то, что нужно: в ubatch'е
+    // есть токен с позицией 0, значит последовательность начинается заново.
+    // apply() вызывается ДО сборки и запуска графа, поэтому обнуление не может
+    // затереть то, что пишет этот же ubatch.
+    {
+        const llama_ubatch & ub = base()->get_ubatch();
+        llama_seq_id done[LLAMA_MAX_SEQ];
+        int n_done = 0;
+        for (uint32_t i = 0; i < ub.n_tokens && ub.pos != nullptr; ++i) {
+            if (ub.pos[i] != 0 || ub.n_seq_id == nullptr || ub.seq_id == nullptr) {
+                continue;
+            }
+            for (int32_t s = 0; s < ub.n_seq_id[i]; ++s) {
+                const llama_seq_id seq_id = ub.seq_id[i][s];
+                bool seen = false;
+                for (int k = 0; k < n_done; ++k) {
+                    seen = seen || done[k] == seq_id;
+                }
+                if (seen || n_done >= LLAMA_MAX_SEQ) {
+                    continue;
+                }
+                done[n_done++] = seq_id;
+                cache->clear_tail_storage(seq_id);
+            }
+        }
+    }
+
     if (!base()->apply()) {
         return false;
     }
+
 
     return !update_lctx || cache->apply_pending_stream_copies(update_lctx);
 }
@@ -1831,9 +1864,126 @@ llama_memory_i::seq_rm_capability llama_kv_cache_kvarn::get_seq_rm_capability() 
     return capability;
 }
 
+
+// ВОЛНА 43. ПОЧИНКА А8/А10.
+//
+// НАЙДЕНО ПООПЕРАЦИОННЫМ СЛЕДОМ (GGML_KVARN_OP_TRACE=1, два процесса,
+// отличающиеся только предыдущим запросом в том же слоте). Первая расходящаяся
+// операция — KVARN_WHT над видом хвоста ne=[256,4,1025,1] в САМОМ ПЕРВОМ
+// ubatch префилла. Всё до неё в графе совпадает знак в знак.
+//
+// ПРИЧИНА. get_tail() отдаёт вид на ВСЮ арену хвоста — get_tail_slots() слотов
+// (history_stride = exact_tail_tokens + rollback_tokens на поток). Вращение
+// применяется ко всей арене каждым графом, а не только к живым слотам. Слоты,
+// которые текущий запрос ещё не переписал, содержат остаток ПРОШЛОГО
+// использования этого потока — при --parallel 1 это предыдущий запрос, при
+// --parallel 4 это предыдущий запрос того же слота. На свежем процессе там
+// нули. Отсюда ровно наблюдавшаяся подпись: первый запрос отличается, все
+// последующие совпадают; прогрев в чужом слоте не помогает; содержимое
+// предыдущего запроса роли не играет (важен лишь факт, что поток уже
+// использовался).
+//
+// В графе основной модели мусор отсекается маской и дальше KVARN_WHT не идёт.
+// В графе чернового шага MTP (kvarn2, вид ne=[256,4,129,1]) расхождение
+// проходит прямо в FLASH_ATTN_EXT и дальше по всему шагу — потому дефект и
+// требовал ОДНОВРЕМЕННО спекуляции и квантованного чернового кэша.
+//
+// ПОЧИНКА. Арена хвоста потока обнуляется, когда последовательность потока
+// удаляется целиком: то, что читается неинициализированным, инициализируется.
+// Раскладка арены — по потокам подряд, по history_stride слотов на поток
+// (llama_kv_tail_compact_layout_for), поэтому обнуляется ровно блок потока
+// плюс возможный нераспределённый остаток в конце арены.
+void llama_kv_cache_kvarn::clear_tail_storage(llama_seq_id seq_id) {
+    const uint32_t slots = metadata->get_tail_slots();
+    if (slots == 0 || layers.empty()) {
+        return;
+    }
+    uint32_t begin = 0;
+    uint32_t count = slots;
+    if (seq_id >= 0) {
+        const uint32_t stride = metadata->get_tail_arena_stride();
+        if (stride == 0 || stride > slots) {
+            return;
+        }
+        const uint32_t stream = metadata->get_stream_for_seq(seq_id);
+        const uint64_t first = uint64_t(stream)*stride;
+        if (first >= slots) {
+            return;
+        }
+        begin = uint32_t(first);
+        count = std::min<uint32_t>(stride, slots - begin);
+        // Хвостовой остаток арены не принадлежит ни одному потоку, но входит в
+        // вид и потому вращается вместе со всеми. Обнуляем его заодно.
+        const uint64_t assigned = uint64_t(metadata->get_n_stream())*stride;
+        if (assigned < slots && begin + count == uint32_t(assigned)) {
+            count = slots - begin;
+        }
+    }
+    // ВОЛНА 43, ГЛАВНОЕ. Вращающийся курсор записи f16-хвоста живёт на
+    // последовательность (llama_kv_tail_store::acquire: slot = seq*stride +
+    // (cursor + offset) % stride) и НЕ обнуляется при удалении
+    // последовательности — только в clear(). Поэтому новый запрос в том же
+    // слоте раскладывает свой хвост со сдвигом, равным числу токенов,
+    // обработанных слотом раньше. Содержимое строк то же, а их МЕСТА в арене
+    // другие; вращение KVARN_WHT идёт по всей арене, и у чернового кэша (129
+    // слотов, маска не закрывает) сдвиг доходит до FLASH_ATTN_EXT и меняет
+    // ответ. Отсюда и «первый запрос отличается», и «важен лишь факт
+    // предыдущего запроса в ЭТОМ слоте, а не его содержимое».
+    metadata->reset_tail_write_cursor(seq_id);
+    if (getenv("LLAMA_KVARN_DEBUG_STAGE")) {
+        LLAMA_LOG_ERROR("KVARN-TAILZERO: seq=%d слотов=%u начиная с %u из %u\n",
+                (int) seq_id, count, begin, slots);
+    }
+    for (const auto & layer : layers) {
+        for (ggml_tensor * tensor : { layer.k_tail, layer.v_tail }) {
+            if (tensor == nullptr || tensor->ne[1] <= 0) {
+                continue;
+            }
+            const uint64_t rows = uint64_t(tensor->ne[1]);
+            if (uint64_t(begin) >= rows) {
+                continue;
+            }
+            const uint64_t n = std::min<uint64_t>(count, rows - begin);
+            const size_t row_bytes = tensor->nb[1];
+            ggml_backend_tensor_memset(tensor, 0, size_t(uint64_t(begin)*row_bytes),
+                    size_t(n*row_bytes));
+        }
+        // Стейдж (f16-строки ещё не запечатанных групп) — второй буфер, чьи
+        // мёртвые строки переживают запрос. Сшивающее ядро (flush) собирает
+        // запечатываемую группу ИЗ РАБОЧЕГО БУФЕРА И ИЗ СТРОК СТЕЙДЖА, поэтому
+        // строка, которую текущий запрос ещё не писал, попадает в квантование
+        // записи. Раскладка — по потокам подряд.
+        for (ggml_tensor * tensor : { layer.k_stage, layer.v_stage }) {
+            if (tensor == nullptr || tensor->ne[1] <= 0) {
+                continue;
+            }
+            const uint64_t rows = uint64_t(tensor->ne[1]);
+            const uint32_t streams = std::max<uint32_t>(1u, n_stream);
+            uint64_t s_begin = 0;
+            uint64_t s_count = rows;
+            if (seq_id >= 0) {
+                if (rows % streams != 0) {
+                    continue;
+                }
+                const uint64_t per = rows/streams;
+                const uint32_t stream = metadata->get_stream_for_seq(seq_id);
+                s_begin = uint64_t(stream)*per;
+                if (s_begin >= rows) {
+                    continue;
+                }
+                s_count = std::min<uint64_t>(per, rows - s_begin);
+            }
+            const size_t row_bytes = tensor->nb[1];
+            ggml_backend_tensor_memset(tensor, 0, size_t(s_begin*row_bytes),
+                    size_t(s_count*row_bytes));
+        }
+    }
+}
+
 void llama_kv_cache_kvarn::clear(bool data) {
     pending_stream_copies = {};
     metadata->clear(false);
+    clear_tail_storage(-1);
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -1929,7 +2079,18 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
                        (int) metadata->can_seq_rm(seq_id, p0, p1));
         return false;
     }
-    return metadata->seq_rm(seq_id, p0, p1);
+    if (!metadata->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+    // Последовательность ушла целиком — арена хвоста этого потока больше никому
+    // не принадлежит, а вращается по-прежнему вся. Обнуляем, иначе следующий
+    // запрос увидит в ещё не переписанных слотах остаток предыдущего.
+    if (seq_id < 0) {
+        clear_tail_storage(-1);
+    } else if (metadata->seq_pos_max(seq_id) < 0) {
+        clear_tail_storage(seq_id);
+    }
+    return true;
 }
 
 bool llama_kv_cache_kvarn::seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) {

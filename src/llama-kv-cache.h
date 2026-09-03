@@ -193,6 +193,13 @@ public:
     uint32_t get_n_stream() const;
     uint32_t get_stream_for_seq(llama_seq_id seq_id) const;
 
+    // ВОЛНА 43. Сброс вращающегося курсора записи f16-хвоста для
+    // последовательности, которая начинается заново. Курсор per-seq
+    // (llama_kv_tail_store::acquire) НЕ обнулялся при удалении
+    // последовательности, поэтому раскладка хвоста нового запроса зависела от
+    // того, сколько токенов слот обработал раньше. seq_id < 0 — все.
+    void reset_tail_write_cursor(llama_seq_id seq_id);
+
     // return all cell indices for seq_id at the given position
     std::vector<uint32_t> cells_at(llama_seq_id seq_id, llama_pos p) const;
 
