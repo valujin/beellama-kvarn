@@ -435,6 +435,10 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-kv-cache-tail.cpp ../src/llama-kv-cache-tail.cpp)
+# Волна 43: перезапуск последовательности не должен зависеть от длины
+# предыдущего запроса — вращающийся курсор записи хвоста обязан сбрасываться.
+llama_build_and_test(test-kv-tail-cursor-restart.cpp ../src/llama-kv-cache-tail.cpp)
+target_include_directories(test-kv-tail-cursor-restart PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_include_directories(test-kv-cache-tail PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-kv-tail-request.cpp ../src/llama-kv-tail-request.cpp ../src/llama-kvarn.cpp)
 target_include_directories(test-kv-tail-request PRIVATE ${PROJECT_SOURCE_DIR}/src)
