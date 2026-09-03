@@ -83,7 +83,19 @@ ggml_cuda_fattn_kvarn_decode_plan_tile(
         const int64_t a1 = ggml_cuda_fattn_kvarn_read_cell(desc, e1, stage1);
         const int span = (token_end - 1) - token_begin;
         const int g0 = e0 != -1 ? (int) (a0 / GGML_CUDA_FATTN_KVARN_DIM) : -1;
-        const bool contiguous = e0 != -1 && e1 != -1 && stage0 == stage1 && (int) (a1 - a0) == span;
+        const int g1 = e1 != -1 ? (int) (a1 / GGML_CUDA_FATTN_KVARN_DIM) : -2;
+        // ВОЛНА 43. Тайл, пересекающий границу группы записи, быстрым путём не
+        // обслуживается. Раньше проверки не было, и при pos_begin != 0 сторона K
+        // уходила на общий загрузчик ЦЕЛИКОМ (k_split_in_group ложно), а сторона V
+        // оставалась ЧАСТИЧНО быстрой: пары с pos1 < 128 читались из записи группы
+        // g0, остальные — общим путём. Две разные арифметики в одном сплите дают
+        // разный результат для одних и тех же данных, и какая из них применится,
+        // решает смещение последовательности в арене ячеек, то есть история
+        // потока. Общий MMA-путь (fattn-mma-kvarn-impl.cuh, `if (group0 != group1)
+        // return tile;`) это условие соблюдает с самого начала; в split-декоде оно
+        // было пропущено.
+        const bool contiguous = e0 != -1 && e1 != -1 && stage0 == stage1 &&
+            (int) (a1 - a0) == span && g0 == g1;
         const bool rec0 = desc.swa ?
             ggml_cuda_fattn_kvarn_decode_swa_record_backed(desc, g0) :
             (!stage0 && (desc.read_indirect || ggml_cuda_fattn_kvarn_decode_group_from_record(desc, g0)));
@@ -990,9 +1002,19 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
         const int n_q,
         const int n_q_heads,
         const int n_kv_heads,
-        const int n_stream) {
+        const int n_stream,
+        // ВОЛНА 43. Фильтр второго прохода: 0 — берём кандидата любой геометрии,
+        // иначе только ту длину сплита / число варпов / ширину GQA-блока, что
+        // выбрал первый проход. См. ggml_cuda_fattn_kvarn_decode_select.
+        const int only_split = 0,
+        const int only_nwarps = 0,
+        const int only_gqa = 0) {
     const int forced_split = ggml_cuda_fattn_kvarn_decode_forced_split();
     if (forced_split > 0 && SPLIT_TOKENS != forced_split) {
+        return;
+    }
+    if (only_split > 0 && (SPLIT_TOKENS != only_split || NWARPS != only_nwarps ||
+            MAX_GQA != only_gqa)) {
         return;
     }
     const int gqa_ratio = n_q_heads / n_kv_heads;
@@ -1135,20 +1157,41 @@ ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
 
     const int nsm = ggml_cuda_info().devices[device].nsm;
     int64_t best_score = INT64_MIN;
+    // ВОЛНА 43. ДВА ПРОХОДА ВМЕСТО ОДНОГО.
+    //
+    // Оценка кандидата содержит n_q через n_q_tiles -> blocks_total -> n_waves,
+    // поэтому один и тот же кэш при шаге генерации (n_q == 1) и при шаге проверки
+    // черновика (n_q >= 2) мог получить РАЗНУЮ геометрию. Замер волны 43
+    // (GGML_CUDA_FA_ROUTE_DEBUG, Qwen3.8-27B, kvarn4/kvarn2, MTP n_max 1):
+    //
+    //   n_kv=2304  : n_q=1 -> split 128 q_tile 1 ; n_q=2 -> split 128 q_tile 1
+    //   n_kv=20224 : n_q=1 -> split 128 q_tile 1 ; n_q=2 -> split 128 q_tile 2
+    //   n_kv=45056 : n_q=1 -> split 128 q_tile 1 ; n_q=2 -> split 128 q_tile 2
+    //
+    // Длина сплита задаёт разбиение KV, а значит и порядок сложения в
+    // online-softmax и в объединяющем проходе: если она зависит от n_q, один и тот
+    // же кэш даёт разные логиты на шаге генерации и на шаге проверки. Ширина тайла
+    // строк запроса порядок сложения ВНУТРИ строки не меняет (см. комментарий к
+    // Q_TILE), поэтому её выбирать по n_q можно и нужно — она и даёт скорость.
+    //
+    // Первый проход выбирает длину сплита, число варпов и ширину GQA-блока при
+    // n_q == 1 — то есть одинаково для всех n_q. Второй берёт ширину тайла среди
+    // кандидатов ТОЛЬКО этой геометрии, уже при настоящем n_q.
+    const int n_q_geometry = 1;
     if constexpr (D == 512) {
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64,  8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64,  8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 16, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 16, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
     } else if constexpr (D == 256) {
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
         // Сплит на 128 токенов совпадает с группой записи: постоянная цена
         // блока (загрузка Q, осей, последовательный расчёт zq, барьеры)
         // раскладывается на вдвое большее число токенов, а число сплитов —
@@ -1156,9 +1199,9 @@ ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
         // падает. Разделяемой памяти нужно на ~5 КиБ больше, четыре блока на
         // мультипроцессор при этом сохраняются.
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 128, 8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
         // Тайл на две строки запроса — ТОЛЬКО со сплитом 128, и вот почему.
         //
         // Буфер частичных сумм имеет размер n_splits * n_q * n_q_heads * D: он
@@ -1188,22 +1231,60 @@ ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
         // при gqa_ratio 6 этого ровно достаточно, чтобы обойтись одним блоком
         // по головам.
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 2>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
         // Тайл на три строки укладывает типичный шаг MTP (n_q = 3) в один блок
         // вместо двух, но просит 31680 байт разделяемой памяти — это три блока
         // на мультипроцессор вместо четырёх. Размен проверяется замером.
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 3>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
     } else if constexpr (D == 128) {
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 4, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 4, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
     }
 
     if (!best.use_split || best.n_splits <= 1) {
         best.use_split = false;
         return best;
+    }
+
+    // ВТОРОЙ ПРОХОД: ширина тайла строк запроса при настоящем n_q, но только среди
+    // кандидатов с уже выбранной длиной сплита / числом варпов / шириной GQA.
+    // Тайл шире одной строки существует только у D == 256, поэтому и проход только
+    // там. Оценка начинается заново с той же геометрии при тайле 1, чтобы сравнение
+    // шло в одних единицах.
+    if constexpr (D == 256) {
+        if (n_q > 1) {
+            const int only_split  = best.split_tokens;
+            const int only_nwarps = best.nwarps;
+            const int only_gqa    = best.gqa_per_block;
+            ggml_cuda_fattn_kvarn_decode_geometry tiled = {};
+            int64_t tiled_score = INT64_MIN;
+            ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 8, K_BITS, V_BITS>(
+                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
+                only_split, only_nwarps, only_gqa);
+            ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 8, K_BITS, V_BITS>(
+                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
+                only_split, only_nwarps, only_gqa);
+            ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS>(
+                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
+                only_split, only_nwarps, only_gqa);
+            ggml_cuda_fattn_kvarn_decode_consider<D, 8, 128, 8, K_BITS, V_BITS>(
+                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
+                only_split, only_nwarps, only_gqa);
+            ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 2>(
+                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
+                only_split, only_nwarps, only_gqa);
+            ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 3>(
+                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
+                only_split, only_nwarps, only_gqa);
+            if (tiled.use_split) {
+                const int candidates = best.candidate_count + tiled.candidate_count;
+                best = tiled;
+                best.candidate_count = candidates;
+            }
+        }
     }
 
     const int direct_blocks_per_wave = nsm * best.max_blocks_per_sm;

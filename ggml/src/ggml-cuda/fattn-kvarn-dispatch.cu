@@ -635,6 +635,16 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_d(
     const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_splits;
     ggml_cuda_pool_alloc<float> partial(pool, partial_count);
     ggml_cuda_pool_alloc<float2> partial_meta(pool, meta_count);
+    // ВОЛНА 43. Пул отдаёт ПЕРЕИСПОЛЬЗОВАННУЮ память: на первом запросе процесса
+    // блок свежий (нули от драйвера), дальше в нём лежит остаток прошлого запуска.
+    // Объединяющее ядро читает partial_meta по ВСЕМ сплитам и включает сплит в
+    // сумму по признаку meta.y > 0, поэтому любая клетка, которую ядро декода не
+    // записало, вносит в ответ содержимое чужого запуска — а на первом запросе
+    // ноль. Это ровно наблюдавшаяся подпись «первый запрос отличается, остальные
+    // совпадают». Обнуление делает исход детерминированным независимо от того,
+    // писал ли кто-то в эту клетку: нулевой знаменатель сплит отбрасывает.
+    CUDA_CHECK(cudaMemsetAsync(partial_meta.get(), 0,
+        meta_count * sizeof(float2), stream));
     ggml_cuda_kv_memory_transient_stats_record_kvarn(
             k_desc.actual_size + v_desc.actual_size,
             partial.actual_size,
@@ -818,6 +828,16 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_q * n_splits;
     ggml_cuda_pool_alloc<float> partial(pool, partial_count);
     ggml_cuda_pool_alloc<float2> partial_meta(pool, meta_count);
+    // ВОЛНА 43. Пул отдаёт ПЕРЕИСПОЛЬЗОВАННУЮ память: на первом запросе процесса
+    // блок свежий (нули от драйвера), дальше в нём лежит остаток прошлого запуска.
+    // Объединяющее ядро читает partial_meta по ВСЕМ сплитам и включает сплит в
+    // сумму по признаку meta.y > 0, поэтому любая клетка, которую ядро декода не
+    // записало, вносит в ответ содержимое чужого запуска — а на первом запросе
+    // ноль. Это ровно наблюдавшаяся подпись «первый запрос отличается, остальные
+    // совпадают». Обнуление делает исход детерминированным независимо от того,
+    // писал ли кто-то в эту клетку: нулевой знаменатель сплит отбрасывает.
+    CUDA_CHECK(cudaMemsetAsync(partial_meta.get(), 0,
+        meta_count * sizeof(float2), stream));
     ggml_cuda_kv_memory_transient_stats_record_kvarn(
             k_desc.actual_size + v_desc.actual_size,
             partial.actual_size,
